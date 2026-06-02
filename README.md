@@ -76,4 +76,4 @@ An always-on agent that can act on a machine and rewrite itself is powerful and 
 
 ## License
 
-TBD
+[MIT](LICENSE) © squirrelsoft-dev
