@@ -1,0 +1,9 @@
+[package]
+name = "csv-task"
+version = "0.1.0"
+edition = "2021"
+description = "RFC 4180 CSV parsing task for the Cordyceps HillClimber proof. The body of parse_csv is intentionally unimplemented; the test suite is the scoreboard."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
