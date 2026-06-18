@@ -1,2 +1,5 @@
 .omc/
 .DS_Store
+# spore-core harness project storage + the recorded held-out scoreboard,
+# written under the workspace root (the repo root) during agent runs.
+.spore/

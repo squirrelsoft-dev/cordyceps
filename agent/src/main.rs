@@ -99,9 +99,9 @@ use spore_core::{
     HarnessStreamEvent, HillClimbingConfig, HillClimbingDirection, HookChain, HookContext,
     HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricEvaluator,
     NullCacheProvider, OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult,
-    SchemaRef, SessionId, SessionState, StandardContextManager, StandardHookChain, StandardTools,
-    Task, TestPassRateEvaluator, ToolCall, ToolResult, ToolsetRef, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    SchemaRef, SessionId, SessionState, SessionStateSnapshot, StandardContextManager,
+    StandardHookChain, StandardTools, Task, TaskId, TestPassRateEvaluator, ToolCall, ToolResult,
+    ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 mod skills;
@@ -245,8 +245,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The SAME conversational ReAct harness as 04 — the differences are a
     // read-WRITE sandbox, the full coding catalogue, and a context window sized
-    // for the model (below). Built once and reused for every REPL turn.
-    let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
+    // for the model (below). Built once and reused for every REPL turn. Held in an
+    // `Arc` so the SAME sandbox also backs the out-of-band held-out scoreboard (the
+    // examiner runs `cargo test` through it, see `score_heldout`).
+    let sandbox = Arc::new(WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(
+        workspace_root.clone(),
+    ))?);
 
     // `conversational` installs a context manager whose compaction window
     // resolves to the gemma static fallback (8K). Override it with one configured
@@ -289,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model)
-        .sandbox(Arc::new(sandbox))
+        .sandbox(sandbox.clone())
         // The coding catalogue PLUS the architect-side `load_skill` tool, so the
         // agent can pull a skill's full procedure into context on demand.
         .tools(StandardTools::coding_set())
@@ -300,11 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // against the registry (see PLAN_SCHEMA_KEY) or startup validation fails.
         // (HillClimbing's `inner` is PlanExecute, so it reuses this same schema.)
         .registry_schema(PLAN_SCHEMA_KEY, serde_json::json!({}))
-        // The held-out scorer for HillClimbing. Registered unconditionally — it is
-        // only CALLED by the `hillclimb` strategy (react / plan-execute ignore it),
-        // but HillClimbing's `evaluator` handle must resolve at startup or the run
-        // halts with an UnresolvedHandle. Keeps one harness build path for all three.
-        .metric_evaluator(examiner())
+        // The DEV scorer drives the climb: HillClimbing calls it each iteration and
+        // routes the result through keep-iff-strictly-better. It scores the VISIBLE
+        // dev set (csv-task/tests/dev.rs) — the feedback the agent revises against.
+        // The held-out set is NEVER wired here; it is the blind scoreboard, measured
+        // out of band (see `score_heldout`). Registered unconditionally — only the
+        // `hillclimb` strategy calls it (react / plan-execute ignore it), but the
+        // HillClimbing `evaluator` handle must resolve at startup or the run halts
+        // with an UnresolvedHandle. Keeps one harness build path for all three.
+        .metric_evaluator(dev_evaluator())
         // Surface the plan to the user the moment it's captured (OnPlanCreated).
         .hooks(plan_announcer())
         .build();
@@ -318,6 +326,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (context_window as f32 * COMPACT_THRESHOLD) as u32,
     );
     println!("workspace : {}", workspace_root.display());
+    println!(
+        "scoring   : climb on DEV (csv-task/tests/dev.rs); held-out blind scoreboard \
+         (csv-examiner/tests/heldout.rs) recorded after each turn"
+    );
     println!(
         "tools     : read_file, write_file, edit_file, list_dir, grep, find_files, bash, load_skill, …"
     );
@@ -537,6 +549,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("\n⏸ run paused (consult/escalate) — send another prompt to continue.\n");
             }
         }
+
+        // The blind scoreboard. After EVERY turn (any strategy), measure the
+        // held-out set out of band against the current state of csv-task on disk and
+        // record it. This is the ONLY place held-out is scored — it never feeds the
+        // loop. For a baseline this is the "fail first" number; for the climb it is
+        // the number the proof is read from (held-out climbing past the baseline).
+        score_heldout(&sandbox, &workspace_root, &session_id, strategy).await;
     }
 
     println!("\nbye.");
@@ -567,6 +586,15 @@ impl Strategy {
             "plan-execute" | "planexecute" | "plan" => Some(Strategy::PlanExecute),
             "hillclimb" | "hill-climb" | "hillclimbing" => Some(Strategy::HillClimb),
             _ => None,
+        }
+    }
+
+    /// Stable lowercase key for logging / the held-out results file.
+    fn key(self) -> &'static str {
+        match self {
+            Strategy::React => "react",
+            Strategy::PlanExecute => "plan-execute",
+            Strategy::HillClimb => "hillclimb",
         }
     }
 
@@ -619,38 +647,124 @@ fn hillclimb_strategy() -> LoopStrategy {
     })
 }
 
-/// The held-out **examiner** — the scoreboard for `hillclimb`. A
-/// [`TestPassRateEvaluator`] that runs `csv-examiner`'s hidden suite via the
-/// sandbox and reports the passing fraction in `[0.0, 1.0]` (Maximize).
-///
-/// It runs ONLY the `heldout` integration target so the output carries exactly one
-/// `running N tests` / `M passed` pair — `pass / total` is then a clean `k/N`. The
-/// command is relative to the workspace root, so launch `hillclimb` from the
-/// cordyceps repo root (where `csv-examiner/` lives). The proposer's write scope is
-/// `csv-task/`; it never sees this crate, so the score can't be gamed.
-///
-/// NOTE: this is the plan's "fitness function — the whole game". The choices baked
-/// in here (which command, the `k/N` granular metric, Maximize, the held-out
-/// target) are deliberately in this one function so they're easy to revise.
-fn examiner() -> Arc<dyn MetricEvaluator> {
-    Arc::new(TestPassRateEvaluator {
+// ============================================================================
+// The two evaluators — dev (drives the climb) and held-out (the blind scoreboard)
+// ============================================================================
+//
+// The dev/held-out split is the anti-gaming mechanism (plan §"fitness function").
+// They MUST be two disjoint evaluators over two disjoint test sets:
+//
+//   * dev      — csv-task/tests/dev.rs, 4 VISIBLE tests. Wired as HillClimbing's
+//                metric_evaluator: it's the feedback the agent revises against and
+//                the fitness the keep-iff-better gate uses. The agent can see/run it.
+//   * held-out — csv-examiner/tests/heldout.rs, 5 HIDDEN tests. The blind
+//                scoreboard: run out of band by the examiner, recorded to disk, and
+//                NEVER fed into the loop. Report THIS number. If dev climbs while
+//                held-out stays flat, the climb is overfitting/gaming — and because
+//                held-out never touched the loop, that divergence is detectable.
+//
+// Collapsing these into one evaluator (optimizing directly on held-out) would
+// destroy the split: there would be nothing left to detect gaming against.
+
+/// The **dev** evaluator — drives the climb. A [`TestPassRateEvaluator`] over the
+/// VISIBLE dev set (`csv-task/tests/dev.rs`, 4 tests), reported as the passing
+/// fraction in `[0.0, 1.0]` (Maximize). This is the loop's fitness function; the
+/// agent may run these same tests itself for feedback while iterating.
+fn dev_evaluator() -> Arc<dyn MetricEvaluator> {
+    Arc::new(pass_rate_evaluator("csv-task/Cargo.toml", "dev"))
+}
+
+/// The **held-out** evaluator — the blind scoreboard. A [`TestPassRateEvaluator`]
+/// over the HIDDEN set (`csv-examiner/tests/heldout.rs`, 5 tests). Run out of band
+/// by [`score_heldout`] after each turn, recorded to disk, and NEVER registered on
+/// the harness, so it can never leak into the loop's keep-iff-better decision.
+fn heldout_evaluator() -> TestPassRateEvaluator {
+    pass_rate_evaluator("csv-examiner/Cargo.toml", "heldout")
+}
+
+/// Build a [`TestPassRateEvaluator`] that runs ONE integration test target
+/// (`cargo test --manifest-path <manifest> --test <target>`) so the output carries
+/// exactly one `running N tests` / `M passed` pair — `pass / total` is then a clean
+/// `k/N`. Commands are relative to the workspace root, so launch from the cordyceps
+/// repo root (where both crates live).
+fn pass_rate_evaluator(manifest: &str, test_target: &str) -> TestPassRateEvaluator {
+    TestPassRateEvaluator {
         command: "cargo".to_string(),
-        args: [
-            "test",
-            "--manifest-path",
-            "csv-examiner/Cargo.toml",
-            "--test",
-            "heldout",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
+        args: ["test", "--manifest-path", manifest, "--test", test_target]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         timeout: Duration::from_secs(EXAMINER_TIMEOUT_SECS),
         // cargo prints e.g. `running 5 tests` and `... 0 passed; 5 failed ...`.
         pass_pattern: r"(\d+) passed".to_string(),
         total_pattern: r"running (\d+) tests".to_string(),
         working_dir: None, // runs at the sandbox/workspace root
-    })
+    }
+}
+
+/// Run the held-out scoreboard ONCE, out of band, and record it. Called after every
+/// REPL turn for EVERY strategy (the baselines' held-out `k/N` is the "fail first"
+/// number; the climb's is the proof). This is the only place held-out is measured —
+/// it is never wired into the loop. The number is printed and appended to
+/// `<workspace>/.spore/cordyceps-heldout.tsv` so it lands on disk.
+///
+/// The evaluator ignores the session snapshot (it only runs a command via the
+/// sandbox), so we hand it a throwaway one.
+async fn score_heldout(
+    sandbox: &WorkspaceScopedSandbox,
+    workspace_root: &std::path::Path,
+    session_id: &SessionId,
+    strategy: Strategy,
+) {
+    let evaluator = heldout_evaluator();
+    let snapshot = SessionStateSnapshot::new(
+        session_id.clone(),
+        TaskId::new("heldout-scoreboard"),
+        SessionState::default(),
+        workspace_root.to_path_buf(),
+    );
+    match evaluator.evaluate(sandbox, &snapshot).await {
+        Ok(result) => {
+            let pass = result.metadata.get("pass").map(String::as_str).unwrap_or("?");
+            let total = result.metadata.get("total").map(String::as_str).unwrap_or("?");
+            println!(
+                "{HEADER}🎯 held-out score: {pass}/{total} = {:.3} (blind — not seen by the agent){RESET}",
+                result.value
+            );
+            record_heldout(workspace_root, strategy, &format!("{pass}/{total}"), result.value);
+        }
+        Err(e) => {
+            eprintln!(
+                "{ERR}🎯 held-out score: could not evaluate ({e}). Run from the cordyceps \
+                 repo root so csv-examiner/ is reachable.{RESET}"
+            );
+        }
+    }
+}
+
+/// Append one held-out measurement to `<workspace>/.spore/cordyceps-heldout.tsv`
+/// (created on first write, with a header). Best-effort: a write failure is logged,
+/// not fatal — the number is still on screen.
+fn record_heldout(workspace_root: &std::path::Path, strategy: Strategy, fraction: &str, value: f64) {
+    use std::io::Write as _;
+    let dir = workspace_root.join(".spore");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("cordyceps-heldout.tsv");
+    let is_new = !path.exists();
+    let line = format!("{}\t{fraction}\t{value:.4}\n", strategy.key());
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if is_new {
+                let _ = f.write_all(b"strategy\theld_out\tvalue\n");
+            }
+            if f.write_all(line.as_bytes()).is_err() {
+                eprintln!("{MUTED}   (could not append held-out score to {}){RESET}", path.display());
+            }
+        }
+        Err(_) => eprintln!("{MUTED}   (could not open {} to record held-out score){RESET}", path.display()),
+    }
 }
 
 /// Print the usage instructions — shown when the binary is run with no
