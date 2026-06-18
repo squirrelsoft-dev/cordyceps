@@ -20,18 +20,23 @@ set -euo pipefail
 
 print_usage() {
   cat <<'EOF'
-Usage: scripts/reset-task.sh [--verify]
+Usage: scripts/reset-task.sh [--verify] [--clear-scores]
 
-  (no args)   reset csv-task/ to its committed RED baseline
-  --verify    reset, then run the dev suite to confirm it is RED again
-  -h, --help  show this help
+  (no args)       reset csv-task/ to its RED baseline (keeps recorded scores)
+  --verify        reset, then run the dev suite to confirm it is RED again
+  --clear-scores  also wipe the recorded held-out scoreboard
+                  (.spore/cordyceps-heldout.tsv). Use at the START of a fresh
+                  experiment, NOT between runs — that would erase the ladder.
+  -h, --help      show this help
 EOF
 }
 
 verify=0
+clear_scores=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --verify) verify=1 ;;
+    --clear-scores) clear_scores=1 ;;
     -h|--help) print_usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; print_usage >&2; exit 2 ;;
   esac
@@ -86,7 +91,21 @@ if ! git diff --quiet "$baseline_ref" -- "$task_dir" \
   echo "✗ csv-task does not match baseline $baseline_ref after reset — inspect 'git status csv-task'." >&2
   exit 1
 fi
-echo "✓ csv-task reset to baseline $baseline_ref ($baseline_sha). target/ and .spore/ scores preserved."
+echo "✓ csv-task reset to baseline $baseline_ref ($baseline_sha). (target/ kept.)"
+
+# Held-out scoreboard: preserved by default, so a react→plan-execute→hillclimb
+# ladder accumulates in one file. Wiped only when --clear-scores is passed.
+scores_file=".spore/cordyceps-heldout.tsv"
+if [ "$clear_scores" -eq 1 ]; then
+  if [ -f "$scores_file" ]; then
+    rm -f "$scores_file"
+    echo "✓ held-out scoreboard cleared ($scores_file)."
+  else
+    echo "  (no held-out scoreboard at $scores_file to clear)"
+  fi
+else
+  echo "  held-out scores preserved ($scores_file) — add --clear-scores to wipe."
+fi
 
 if [ "$verify" -eq 1 ]; then
   echo "Verifying the dev suite is RED…"
