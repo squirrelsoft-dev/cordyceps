@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 #
-# reset-task.sh — restore the csv-task fixture to its committed RED baseline
-# between HillClimber runs, so you don't have to remember the git incantation.
+# reset-task.sh — restore the csv-task fixture to its RED baseline between
+# HillClimber runs, so you don't have to remember the git incantation.
+#
+# The reset target is a fixed TAG (csv-task-baseline), not HEAD — so even after
+# you commit progress to csv-task, "reset" still means "back to the original RED
+# baseline". Override the ref with CORDYCEPS_BASELINE_REF=<ref>.
 #
 # The proposing agent only edits csv-task/, so that is all this resets:
-#   - tracked edits (e.g. csv-task/src/lib.rs) are restored from HEAD
+#   - tracked edits (e.g. csv-task/src/lib.rs) are restored from the baseline tag
 #   - untracked files the agent added under csv-task/ are removed
 #   - csv-task/target/ is KEPT (gitignored) so rebuilds stay fast
 #
@@ -40,9 +44,21 @@ repo_root="$(git -C "$script_dir" rev-parse --show-toplevel)"
 cd "$repo_root"
 
 task_dir="csv-task"
+baseline_ref="${CORDYCEPS_BASELINE_REF:-csv-task-baseline}"
 
-# 1. Restore tracked files (index + worktree) from the last commit.
-git checkout HEAD -- "$task_dir"
+# The baseline must exist. Create it once at the RED commit (see error help).
+if ! git rev-parse --verify --quiet "${baseline_ref}^{commit}" >/dev/null; then
+  echo "✗ baseline ref '$baseline_ref' not found." >&2
+  echo "  Create it once at the RED baseline commit, e.g.:" >&2
+  echo "      git tag -a $baseline_ref -m 'csv-task RED baseline'" >&2
+  echo "  or point CORDYCEPS_BASELINE_REF at an existing ref." >&2
+  exit 1
+fi
+
+# 1. Restore csv-task's tracked files from the baseline tag. --source restores the
+#    WORKTREE only (the index is left alone), so `git status` stays honest: after
+#    HEAD has moved past the baseline, csv-task simply reads as "modified vs HEAD".
+git restore --source="$baseline_ref" -- "$task_dir"
 
 # 2. Remove untracked files the agent added (gitignored target/ is preserved
 #    because plain `git clean` skips ignored paths — no -x).
@@ -61,12 +77,16 @@ for guard in csv-examiner agent; do
   fi
 done
 
-sha="$(git rev-parse --short HEAD)"
-if [ -n "$(git status --porcelain -- "$task_dir")" ]; then
-  echo "✗ csv-task still differs from HEAD after reset — inspect 'git status csv-task'." >&2
+# Success = csv-task's worktree matches the baseline (tracked files) AND no
+# untracked files remain. We compare to the TAG, not HEAD, because the whole point
+# is to land on the baseline even when HEAD has moved past it.
+baseline_sha="$(git rev-parse --short "${baseline_ref}^{commit}")"
+if ! git diff --quiet "$baseline_ref" -- "$task_dir" \
+   || [ -n "$(git ls-files --others --exclude-standard -- "$task_dir")" ]; then
+  echo "✗ csv-task does not match baseline $baseline_ref after reset — inspect 'git status csv-task'." >&2
   exit 1
 fi
-echo "✓ csv-task reset to its committed baseline ($sha). target/ and .spore/ scores preserved."
+echo "✓ csv-task reset to baseline $baseline_ref ($baseline_sha). target/ and .spore/ scores preserved."
 
 if [ "$verify" -eq 1 ]; then
   echo "Verifying the dev suite is RED…"
