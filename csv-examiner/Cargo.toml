@@ -1,0 +1,12 @@
+[package]
+name = "csv-examiner"
+version = "0.1.0"
+edition = "2021"
+description = "The examiner for the Cordyceps HillClimber proof. Holds the hidden held-out RFC 4180 scoring tests for csv-task, kept outside the proposing agent's write scope."
+license = "MIT"
+
+# The examiner depends on csv-task only to run its tests against it. The held-out
+# suite (tests/heldout.rs) calls csv_task::parse_csv through this path dependency,
+# so it always scores whatever csv-task currently builds.
+[dev-dependencies]
+csv-task = { path = "../csv-task" }

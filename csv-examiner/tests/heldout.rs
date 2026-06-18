@@ -1,9 +1,12 @@
-//! Held-out test suite — the HIDDEN scoring tests.
+//! Held-out test suite — the HIDDEN scoring tests, owned by the EXAMINER.
 //!
-//! The proposing agent never sees or runs these; the examiner runs them to
-//! produce the held-out `k/N` score that actually counts. They exercise the
-//! trickier RFC 4180 rules that a naive `input.split(',')` gets wrong, so dev
-//! climbing while held-out stays flat exposes overfitting/gaming automatically.
+//! This file lives in `csv-examiner/`, deliberately OUTSIDE the proposing
+//! agent's write scope (`csv-task/`). The agent never sees, runs, or can modify
+//! these tests; the examiner runs them against whatever `csv_task::parse_csv`
+//! currently builds and reports the held-out `k/N` score that actually counts.
+//! They exercise the trickier RFC 4180 rules that a naive `input.split(',')`
+//! gets wrong, so dev climbing while held-out stays flat exposes
+//! overfitting/gaming automatically.
 //!
 //! Reference: RFC 4180, "Common Format and MIME Type for CSV Files".
 
