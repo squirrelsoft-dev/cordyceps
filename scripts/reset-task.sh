@@ -25,7 +25,7 @@ Usage: scripts/reset-task.sh [--verify] [--clear-scores]
   (no args)       reset csv-task/ to its RED baseline (keeps recorded scores)
   --verify        reset, then run the dev suite to confirm it is RED again
   --clear-scores  also wipe the recorded held-out scoreboard
-                  (.spore/cordyceps-heldout.tsv). Use at the START of a fresh
+                  (.spore/cordyceps-ledger.tsv). Use at the START of a fresh
                   experiment, NOT between runs — that would erase the ladder.
   -h, --help      show this help
 EOF
@@ -95,7 +95,7 @@ echo "✓ csv-task reset to baseline $baseline_ref ($baseline_sha). (target/ kep
 
 # Held-out scoreboard: preserved by default, so a react→plan-execute→hillclimb
 # ladder accumulates in one file. Wiped only when --clear-scores is passed.
-scores_file=".spore/cordyceps-heldout.tsv"
+scores_file=".spore/cordyceps-ledger.tsv"
 if [ "$clear_scores" -eq 1 ]; then
   if [ -f "$scores_file" ]; then
     rm -f "$scores_file"

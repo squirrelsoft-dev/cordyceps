@@ -97,8 +97,9 @@ use spore_core::{
     AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, EscalationAction,
     FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
     HarnessStreamEvent, HillClimbingConfig, HillClimbingDirection, HookChain, HookContext,
-    HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricEvaluator,
-    NullCacheProvider, OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult,
+    HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricError,
+    MetricEvaluator, MetricResult, NullCacheProvider, OllamaModelInterface, PlanExecuteConfig,
+    ReactConfig, Role, RunResult,
     SchemaRef, SessionId, SessionState, SessionStateSnapshot, StandardContextManager,
     StandardHookChain, StandardTools, Task, TaskId, TestPassRateEvaluator, ToolCall, ToolResult,
     ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
@@ -156,6 +157,14 @@ const HILLCLIMB_MAX_STAGNATION: u32 = 3;
 /// counts as a [`MetricError::Timeout`] for that iteration. Generous because the
 /// first run compiles the proposer's `csv-task` crate from scratch.
 const EXAMINER_TIMEOUT_SECS: u64 = 180;
+
+/// Version of the scored fixture (the dev + held-out test sets). Stamped on every
+/// ledger row, because difficulty lives in the test sets — scores are ONLY
+/// comparable within the same fixture version. Bump this whenever dev/heldout
+/// change, and re-tag the RED baseline (`csv-task-baseline`) to match.
+///   v2: dev expanded to 10 skill-mirrored tests (gives the climb a gradient);
+///       held-out 15 adversarial tests, disjoint inputs.
+const FIXTURE_VERSION: &str = "v2";
 
 /// Registry key for the plan slot's output schema. The PlanExecute `plan` slot is
 /// STRUCTURED — startup validation rejects a bare ReAct there unless its leaf
@@ -328,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("workspace : {}", workspace_root.display());
     println!(
         "scoring   : climb on DEV (csv-task/tests/dev.rs); held-out blind scoreboard \
-         (csv-examiner/tests/heldout.rs) recorded after each turn"
+         (csv-examiner/tests/heldout.rs) → .spore/cordyceps-ledger.tsv [fixture {FIXTURE_VERSION}]"
     );
     println!(
         "tools     : read_file, write_file, edit_file, list_dir, grep, find_files, bash, load_skill, …"
@@ -550,12 +559,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // The blind scoreboard. After EVERY turn (any strategy), measure the
-        // held-out set out of band against the current state of csv-task on disk and
-        // record it. This is the ONLY place held-out is scored — it never feeds the
-        // loop. For a baseline this is the "fail first" number; for the climb it is
-        // the number the proof is read from (held-out climbing past the baseline).
-        score_heldout(&sandbox, &workspace_root, &session_id, strategy).await;
+        // After EVERY turn (any strategy), score the run out of band against the
+        // current state of csv-task on disk and append it to the versioned ledger:
+        // the dev pair (climb fitness) and the blind held-out number (the proof).
+        // Neither measurement feeds the loop. For a baseline this is the "fail first"
+        // number; for the climb it's the number the proof is read from.
+        score_run(&sandbox, &workspace_root, &session_id, strategy).await;
     }
 
     println!("\nbye.");
@@ -654,9 +663,10 @@ fn hillclimb_strategy() -> LoopStrategy {
 // The dev/held-out split is the anti-gaming mechanism (plan §"fitness function").
 // They MUST be two disjoint evaluators over two disjoint test sets:
 //
-//   * dev      — csv-task/tests/dev.rs, 4 VISIBLE tests. Wired as HillClimbing's
-//                metric_evaluator: it's the feedback the agent revises against and
-//                the fitness the keep-iff-better gate uses. The agent can see/run it.
+//   * dev      — csv-task/tests/dev.rs, 10 VISIBLE skill-mirrored tests. Wired as
+//                HillClimbing's metric_evaluator: it's the feedback the agent revises
+//                against and the fitness the keep-iff-better gate uses. Hard enough
+//                that a single shot can't ace it, so the climb has a gradient.
 //   * held-out — csv-examiner/tests/heldout.rs, 15 HIDDEN adversarial tests. The
 //                blind scoreboard: run out of band by the examiner, recorded to disk, and
 //                NEVER fed into the loop. Report THIS number. If dev climbs while
@@ -667,9 +677,9 @@ fn hillclimb_strategy() -> LoopStrategy {
 // destroy the split: there would be nothing left to detect gaming against.
 
 /// The **dev** evaluator — drives the climb. A [`TestPassRateEvaluator`] over the
-/// VISIBLE dev set (`csv-task/tests/dev.rs`, 4 tests), reported as the passing
-/// fraction in `[0.0, 1.0]` (Maximize). This is the loop's fitness function; the
-/// agent may run these same tests itself for feedback while iterating.
+/// VISIBLE dev set (`csv-task/tests/dev.rs`, 10 skill-mirrored tests), reported as
+/// the passing fraction in `[0.0, 1.0]` (Maximize). This is the loop's fitness
+/// function; the agent may run these same tests itself for feedback while iterating.
 fn dev_evaluator() -> Arc<dyn MetricEvaluator> {
     Arc::new(pass_rate_evaluator("csv-task/Cargo.toml", "dev"))
 }
@@ -702,68 +712,88 @@ fn pass_rate_evaluator(manifest: &str, test_target: &str) -> TestPassRateEvaluat
     }
 }
 
-/// Run the held-out scoreboard ONCE, out of band, and record it. Called after every
-/// REPL turn for EVERY strategy (the baselines' held-out `k/N` is the "fail first"
-/// number; the climb's is the proof). This is the only place held-out is measured —
-/// it is never wired into the loop. The number is printed and appended to
-/// `<workspace>/.spore/cordyceps-heldout.tsv` so it lands on disk.
-///
-/// The evaluator ignores the session snapshot (it only runs a command via the
-/// sandbox), so we hand it a throwaway one.
-async fn score_heldout(
+/// Score a finished run OUT OF BAND and record it to the ledger. Called after every
+/// REPL turn for EVERY strategy. Runs BOTH evaluators against the final state of
+/// csv-task on disk:
+///   - dev — the climb's own fitness, re-measured here for the record so the ledger
+///     shows the dev/held-out PAIR. (Reading both is the overfitting check: dev up
+///     while held-out flat ⇒ gaming.)
+///   - held-out — the blind scoreboard, the number the proof is read from.
+/// Neither measurement feeds the loop; this is pure recording. The evaluators ignore
+/// the session snapshot (they only run a command via the sandbox), so it's throwaway.
+async fn score_run(
     sandbox: &WorkspaceScopedSandbox,
     workspace_root: &std::path::Path,
     session_id: &SessionId,
     strategy: Strategy,
 ) {
-    let evaluator = heldout_evaluator();
     let snapshot = SessionStateSnapshot::new(
         session_id.clone(),
-        TaskId::new("heldout-scoreboard"),
+        TaskId::new("scoreboard"),
         SessionState::default(),
         workspace_root.to_path_buf(),
     );
-    match evaluator.evaluate(sandbox, &snapshot).await {
-        Ok(result) => {
-            let pass = result.metadata.get("pass").map(String::as_str).unwrap_or("?");
-            let total = result.metadata.get("total").map(String::as_str).unwrap_or("?");
-            println!(
-                "{HEADER}🎯 held-out score: {pass}/{total} = {:.3} (blind — not seen by the agent){RESET}",
-                result.value
-            );
-            record_heldout(workspace_root, strategy, &format!("{pass}/{total}"), result.value);
+    // dev_evaluator() yields a trait object; both .evaluate() the same way.
+    let dev = dev_evaluator().evaluate(sandbox, &snapshot).await;
+    let held = heldout_evaluator().evaluate(sandbox, &snapshot).await;
+
+    // Render "k/N" + value from a MetricResult, or "err"/NaN on evaluator failure.
+    let render = |r: &Result<MetricResult, MetricError>| match r {
+        Ok(m) => {
+            let p = m.metadata.get("pass").map(String::as_str).unwrap_or("?");
+            let t = m.metadata.get("total").map(String::as_str).unwrap_or("?");
+            (format!("{p}/{t}"), m.value)
         }
-        Err(e) => {
-            eprintln!(
-                "{ERR}🎯 held-out score: could not evaluate ({e}). Run from the cordyceps \
-                 repo root so csv-examiner/ is reachable.{RESET}"
-            );
-        }
+        Err(_) => ("err".to_string(), f64::NAN),
+    };
+    let (dev_frac, _dev_val) = render(&dev);
+    let (held_frac, held_val) = render(&held);
+
+    if let Err(e) = &held {
+        eprintln!(
+            "{ERR}🎯 could not evaluate held-out ({e}). Run from the cordyceps repo root \
+             so csv-examiner/ is reachable.{RESET}"
+        );
     }
+    println!(
+        "{HEADER}🎯 held-out {held_frac} = {held_val:.3} (blind — the proof number)   \
+         [dev {dev_frac}, fixture {FIXTURE_VERSION}]{RESET}"
+    );
+    record_run(workspace_root, strategy, &dev_frac, &held_frac, held_val);
 }
 
-/// Append one held-out measurement to `<workspace>/.spore/cordyceps-heldout.tsv`
-/// (created on first write, with a header). Best-effort: a write failure is logged,
-/// not fatal — the number is still on screen.
-fn record_heldout(workspace_root: &std::path::Path, strategy: Strategy, fraction: &str, value: f64) {
+/// Append one row to the versioned ledger `<workspace>/.spore/cordyceps-ledger.tsv`
+/// (created on first write, with a header). The `fixture` column versions the row:
+/// scores are only comparable WITHIN a fixture version, because the test sets change
+/// the difficulty. Best-effort — a write failure is logged, not fatal.
+fn record_run(
+    workspace_root: &std::path::Path,
+    strategy: Strategy,
+    dev_frac: &str,
+    held_frac: &str,
+    held_val: f64,
+) {
     use std::io::Write as _;
     let dir = workspace_root.join(".spore");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("cordyceps-heldout.tsv");
+    let path = dir.join("cordyceps-ledger.tsv");
     let is_new = !path.exists();
-    let line = format!("{}\t{fraction}\t{value:.4}\n", strategy.key());
+    let line = format!(
+        "{FIXTURE_VERSION}\t{}\t{dev_frac}\t{held_frac}\t{held_val:.4}\n",
+        strategy.key()
+    );
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
             if is_new {
-                let _ = f.write_all(b"strategy\theld_out\tvalue\n");
+                let _ = f.write_all(b"fixture\tstrategy\tdev\theld_out\theld_out_value\n");
             }
             if f.write_all(line.as_bytes()).is_err() {
-                eprintln!("{MUTED}   (could not append held-out score to {}){RESET}", path.display());
+                eprintln!("{MUTED}   (could not append to ledger {}){RESET}", path.display());
             }
         }
-        Err(_) => eprintln!("{MUTED}   (could not open {} to record held-out score){RESET}", path.display()),
+        Err(_) => eprintln!("{MUTED}   (could not open ledger {}){RESET}", path.display()),
     }
 }
 
