@@ -657,8 +657,8 @@ fn hillclimb_strategy() -> LoopStrategy {
 //   * dev      — csv-task/tests/dev.rs, 4 VISIBLE tests. Wired as HillClimbing's
 //                metric_evaluator: it's the feedback the agent revises against and
 //                the fitness the keep-iff-better gate uses. The agent can see/run it.
-//   * held-out — csv-examiner/tests/heldout.rs, 5 HIDDEN tests. The blind
-//                scoreboard: run out of band by the examiner, recorded to disk, and
+//   * held-out — csv-examiner/tests/heldout.rs, 15 HIDDEN adversarial tests. The
+//                blind scoreboard: run out of band by the examiner, recorded to disk, and
 //                NEVER fed into the loop. Report THIS number. If dev climbs while
 //                held-out stays flat, the climb is overfitting/gaming — and because
 //                held-out never touched the loop, that divergence is detectable.
@@ -675,7 +675,7 @@ fn dev_evaluator() -> Arc<dyn MetricEvaluator> {
 }
 
 /// The **held-out** evaluator — the blind scoreboard. A [`TestPassRateEvaluator`]
-/// over the HIDDEN set (`csv-examiner/tests/heldout.rs`, 5 tests). Run out of band
+/// over the HIDDEN set (`csv-examiner/tests/heldout.rs`, 15 adversarial tests). Run out of band
 /// by [`score_heldout`] after each turn, recorded to disk, and NEVER registered on
 /// the harness, so it can never leak into the loop's keep-iff-better decision.
 fn heldout_evaluator() -> TestPassRateEvaluator {
@@ -695,7 +695,7 @@ fn pass_rate_evaluator(manifest: &str, test_target: &str) -> TestPassRateEvaluat
             .map(|s| s.to_string())
             .collect(),
         timeout: Duration::from_secs(EXAMINER_TIMEOUT_SECS),
-        // cargo prints e.g. `running 5 tests` and `... 0 passed; 5 failed ...`.
+        // cargo prints e.g. `running 15 tests` and `... 0 passed; 15 failed ...`.
         pass_pattern: r"(\d+) passed".to_string(),
         total_pattern: r"running (\d+) tests".to_string(),
         working_dir: None, // runs at the sandbox/workspace root
