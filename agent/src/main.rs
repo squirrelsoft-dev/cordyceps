@@ -90,6 +90,7 @@
 //! ```
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,7 +99,8 @@ use spore_core::{
     FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
     HarnessStreamEvent, HillClimbingConfig, HillClimbingDirection, HookChain, HookContext,
     HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricError,
-    MetricEvaluator, MetricResult, NullCacheProvider, OllamaModelInterface, PlanExecuteConfig,
+    MetricEvaluator, MetricResult, ModelParams, NullCacheProvider, OllamaModelInterface,
+    PlanExecuteConfig,
     ReactConfig, Role, RunResult,
     SchemaRef, SessionId, SessionState, SessionStateSnapshot, StandardContextManager,
     StandardHookChain, StandardTools, Task, TaskId, TestPassRateEvaluator, ToolCall, ToolResult,
@@ -192,6 +194,16 @@ const DEFAULT_CONTEXT_WINDOW: u32 = 256_000;
 /// it. This is `CompactionConfig`'s own default; we name it for clarity.
 const COMPACT_THRESHOLD: f32 = 0.80;
 
+/// Default reasoning budget when reasoning isn't explicitly configured. gemma4
+/// is a reasoning model, so we ask for its thinking pass by default. For Ollama
+/// the magnitude is irrelevant — any positive value maps to `think: true` (the
+/// spore-core client gates that on the model's `"thinking"` capability, so a
+/// non-reasoning model silently no-ops). Set `--reasoning 0` /
+/// `SPORE_REASONING_BUDGET=0` to turn it off (e.g. to reproduce a pre-reasoning
+/// ledger run). The value is carried as an Anthropic-style token budget so the
+/// same knob ports if the backend ever changes.
+const DEFAULT_REASONING_BUDGET: u32 = 2048;
+
 // ANSI styling for the REPL trace. The `send_message` narration is the group
 // SECTION HEADER — bright white and flush left, so it stands out as the one line
 // the user is meant to read. The think / act / obs detail under it is dim and
@@ -237,6 +249,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("SPORE_CONTEXT_WINDOW").ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+    // Reasoning is ON by default (gemma4 is a reasoning model). An explicit
+    // `--reasoning 0` / `SPORE_REASONING_BUDGET=0` disables it; an unparseable
+    // value falls back to the default rather than silently turning it off.
+    let reasoning_budget: Option<u32> = match arg_value(&args, "--reasoning")
+        .or_else(|| std::env::var("SPORE_REASONING_BUDGET").ok())
+    {
+        Some(s) => {
+            let n = s.parse::<u32>().unwrap_or(DEFAULT_REASONING_BUDGET);
+            (n > 0).then_some(n)
+        }
+        None => Some(DEFAULT_REASONING_BUDGET),
+    };
 
     // The agent operates inside a writable workspace root. By DEFAULT this is the
     // directory you launched from (the current working directory) — so running
@@ -308,6 +333,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools(StandardTools::coding_set())
         .tool(skills::load_skill_tool(active.clone(), known.clone()))
         .system_prompt(SYSTEM_PROMPT)
+        // Request the model's reasoning pass. spore-core's Ollama client turns a
+        // positive `reasoning_budget` into `think: true` for thinking-capable
+        // models and surfaces the trace as `ReasoningDelta` stream events, which
+        // the sink prints live. Everything else stays at `ModelParams::default`.
+        .model_params(ModelParams {
+            reasoning_budget,
+            ..Default::default()
+        })
         .context_manager(context_manager)
         // PlanExecute's `plan` slot is structured: its output schema must resolve
         // against the registry (see PLAN_SCHEMA_KEY) or startup validation fails.
@@ -328,6 +361,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cordyceps agent — spore-core HillClimber harness");
     println!("model     : {model_id}");
+    println!(
+        "reasoning : {}",
+        match reasoning_budget {
+            Some(n) => format!("on (budget {n} → think:true on thinking-capable models)"),
+            None => "off (--reasoning <n> or $SPORE_REASONING_BUDGET to enable)".to_string(),
+        }
+    );
     println!("strategy  : {}", strategy.banner());
     println!(
         "context   : {context_window} tokens (compact at {:.0}% → {} tokens)",
@@ -427,6 +467,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stray `\r` is harmless when raw mode isn't active (the non-TTY
         // fallback in `run_abortable`).
         let mirror = turn_msgs.clone();
+        // Live reasoning trace (gemma4 thinking, surfaced as `ReasoningDelta`).
+        // It streams FRAGMENT by fragment rather than buffering to a tool call:
+        // a turn stuck mid-reason never reaches one, so buffering would hide
+        // exactly the runaway we want to watch for. `reason_open` tracks whether a
+        // `reason ·` line is mid-flight; `flush_reason` closes it before any
+        // coarse line so the two never collide. The original handle stays behind
+        // for a final flush once the run returns (see below).
+        let reason_open = Arc::new(AtomicBool::new(false));
+        let sink_reason = reason_open.clone();
         let sink: Arc<dyn Fn(HarnessStreamEvent) + Send + Sync> =
             Arc::new(move |event: HarnessStreamEvent| match event {
                 // The agent's running narration via `send_message` is the section
@@ -434,11 +483,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // answer — is all the user is really meant to read. (Not recorded:
                 // the send_message tool already appears as a tool call + result.)
                 HarnessStreamEvent::UserMessage { content, .. } => {
+                    flush_reason(&sink_reason);
                     print!("{HEADER}💬 {content}{RESET}\r\n");
                 }
                 // Everything else is muted, indented detail beneath that header.
                 HarnessStreamEvent::TurnStart { turn, .. } => {
+                    flush_reason(&sink_reason);
                     print!("{MUTED}   think · turn {turn}{RESET}\r\n");
+                }
+                // Streamed reasoning fragments. The first of a block prints the
+                // `reason ·` prefix; embedded newlines re-indent into the muted
+                // detail column so multi-line reasoning reads cleanly. Flushed by
+                // the next coarse event (the action the reasoning led to). We flush
+                // stdout each fragment — it has no trailing `\n`, so line buffering
+                // would otherwise hold it back and defeat the "live" point.
+                HarnessStreamEvent::ReasoningDelta { content, .. } => {
+                    if !sink_reason.swap(true, Ordering::Relaxed) {
+                        print!("{MUTED}   reason · ");
+                    }
+                    print!("{}", content.replace('\n', "\r\n            "));
+                    let _ = std::io::stdout().flush();
                 }
                 HarnessStreamEvent::ToolCall {
                     call_id,
@@ -446,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args,
                     ..
                 } => {
+                    flush_reason(&sink_reason);
                     print!("{MUTED}   act → {name}({args}){RESET}\r\n");
                     mirror.lock().unwrap().push(Message {
                         role: Role::Assistant,
@@ -462,6 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     content,
                     ..
                 } => {
+                    flush_reason(&sink_reason);
                     let (color, tag) = if is_error {
                         (ERR, "obs(err)")
                     } else {
@@ -476,6 +542,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             is_error,
                         }),
                     });
+                }
+                // The final turn's reasoning closes here, just before the answer
+                // itself prints from `RunResult` once the run returns.
+                HarnessStreamEvent::FinalResponse { .. } => {
+                    flush_reason(&sink_reason);
                 }
                 _ => {}
             });
@@ -494,7 +565,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `drive` runs the turn to a terminal result — auto-granting more budget
         // when it pauses on a spent budget so the plan gets worked to completion —
         // and stays Esc-abortable throughout. `None` ⇒ the user aborted.
-        match drive(&harness, options, sink).await {
+        let outcome = drive(&harness, options, sink).await;
+        // Close any reasoning line left open (e.g. an Esc landed mid-reason)
+        // before the next line — the answer, abort notice, or REPL prompt — prints.
+        flush_reason(&reason_open);
+        match outcome {
             None => {
                 // Reconstruct the aborted turn so "continue" still has context:
                 // prior history + this turn's user prompt + the tool calls/results
@@ -829,6 +904,8 @@ OPTIONS:
     --model <id>          Ollama model (default: gemma4:e4b, or $SPORE_OLLAMA_MODEL)
     --workspace <path>    workspace root the agent reads/writes (default: cwd)
     --context-window <n>  compaction window in tokens (default: 256000)
+    --reasoning <budget>  request the model's reasoning pass (default: 2048;
+                          0 disables; or $SPORE_REASONING_BUDGET)
     --help, -h            show this message
 
 EXAMPLES (run from the cordyceps repo root):
@@ -1058,6 +1135,16 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Close a live `reason ·` line if one is mid-flight. Reasoning streams as
+/// fragments with no trailing newline (see the sink's `ReasoningDelta` arm), so
+/// before any other trace line prints we terminate the open line and clear the
+/// flag. No-op when no reasoning line is open, so it's safe to call liberally.
+fn flush_reason(open: &AtomicBool) {
+    if open.swap(false, Ordering::Relaxed) {
+        print!("{RESET}\r\n");
+    }
 }
 
 /// Keep observe lines readable — file contents can be long.
