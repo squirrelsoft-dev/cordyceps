@@ -95,11 +95,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spore_core::{
-    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, EscalationAction,
-    FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
+    AgentError, AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content,
+    EscalationAction,
+    FunctionHook, HaltReason, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
     HarnessStreamEvent, HillClimbingConfig, HillClimbingDirection, HookChain, HookContext,
     HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricError,
-    MetricEvaluator, MetricResult, ModelParams, NullCacheProvider, OllamaModelInterface,
+    MetricEvaluator, MetricResult, ModelError, ModelParams, NullCacheProvider, OllamaModelInterface,
     PlanExecuteConfig,
     ReactConfig, Role, RunResult,
     SchemaRef, SessionId, SessionState, SessionStateSnapshot, StandardContextManager,
@@ -207,6 +208,12 @@ const COMPACT_THRESHOLD: f32 = 0.80;
 /// spore-core gates the level on the model's `"thinking"` capability, so a
 /// non-reasoning model silently no-ops.
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+
+/// How many times to retry a turn that died on a TRANSIENT transport error (a
+/// dropped/garbled stream, a flaky endpoint's GOAWAY, a timeout, a 5xx) before
+/// giving up. Each retry re-runs the turn from the same starting point with
+/// exponential backoff (1s, 2s, 4s). Deterministic failures are never retried.
+const MAX_TRANSPORT_RETRIES: u32 = 3;
 
 // ANSI styling for the REPL trace. The `send_message` narration is the group
 // SECTION HEADER — bright white and flush left, so it stands out as the one line
@@ -459,8 +466,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // durable task list (plan-execute / hillclimb) is project-scoped, so a turn
         // that runs out of budget mid-list resumes the unfinished tasks on a later
         // turn instead of re-planning. Files the agent wrote earlier are still on
-        // disk AND the dialogue carries forward, so it can build on both.
-        let task = Task::new(prompt.clone(), session_id.clone(), strategy.loop_strategy());
+        // disk AND the dialogue carries forward, so it can build on both. The task
+        // is (re)built per attempt inside the retry loop below.
 
         // Mirror this turn's conversation as it streams. On a clean finish we use
         // the harness's own lossless `session_state`; but an Esc-aborted run is
@@ -565,22 +572,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Assign `on_stream` directly (it's a public `Option<StreamSink>`) rather
         // than `with_stream`, which wants a bare `Fn` — our sink is already the
         // shared `Arc` so we can hand the SAME one to `resume` inside `drive`.
-        let mut options = HarnessRunOptions::new(task);
-        options.on_stream = Some(sink.clone());
-        // Carry the running conversation into this turn (no-op on the first).
-        // CLONE rather than take: an aborted run never hands back a post-run
-        // state, so keeping `history` intact lets us rebuild from it below.
-        if let Some(state) = &history {
-            options = options.with_session_state(state.clone());
-        }
+        // Run the turn, RETRYING a transient transport failure (a dropped or
+        // garbled stream, a flaky endpoint's GOAWAY, a timeout, a 5xx) instead of
+        // letting one hiccup kill the run. Bounded, with backoff. Each attempt is a
+        // fresh turn from the SAME starting point (prior `history` + this prompt),
+        // so a retry can't double up partial in-turn work. Success, abort, a pause,
+        // or a DETERMINISTIC error (bad request, missing model, context overflow)
+        // falls through unchanged — a retry can't fix those.
+        let mut outcome = None;
+        for attempt in 0..=MAX_TRANSPORT_RETRIES {
+            // Clear the abort-path mirror so a prior attempt's tool calls can't
+            // leak into a later abort reconstruction.
+            turn_msgs.lock().unwrap().clear();
+            let task = Task::new(prompt.clone(), session_id.clone(), strategy.loop_strategy());
+            let mut options = HarnessRunOptions::new(task);
+            options.on_stream = Some(sink.clone());
+            // Carry the running conversation into this turn (no-op on the first).
+            if let Some(state) = &history {
+                options = options.with_session_state(state.clone());
+            }
 
-        // `drive` runs the turn to a terminal result — auto-granting more budget
-        // when it pauses on a spent budget so the plan gets worked to completion —
-        // and stays Esc-abortable throughout. `None` ⇒ the user aborted.
-        let outcome = drive(&harness, options, sink).await;
-        // Close any reasoning line left open (e.g. an Esc landed mid-reason)
-        // before the next line — the answer, abort notice, or REPL prompt — prints.
-        flush_reason(&reason_open);
+            // `drive` runs the turn to a terminal result — auto-granting more
+            // budget when it pauses on a spent budget — and stays Esc-abortable.
+            let result = drive(&harness, options, sink.clone()).await;
+            // Close any reasoning line left open (e.g. an Esc landed mid-reason)
+            // before the next line — answer, retry notice, or prompt — prints.
+            flush_reason(&reason_open);
+
+            if attempt < MAX_TRANSPORT_RETRIES {
+                if let Some(RunResult::Failure {
+                    reason: HaltReason::AgentError { error },
+                    ..
+                }) = &result
+                {
+                    if is_retryable_transport(error) {
+                        let wait = Duration::from_secs(1u64 << attempt);
+                        eprintln!(
+                            "{MUTED}   … transient model error — retrying in {}s \
+                             (attempt {}/{}){RESET}",
+                            wait.as_secs(),
+                            attempt + 1,
+                            MAX_TRANSPORT_RETRIES
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
+            }
+            outcome = result;
+            break;
+        }
         match outcome {
             None => {
                 // Reconstruct the aborted turn so "continue" still has context:
@@ -1159,6 +1200,39 @@ fn flush_reason(open: &AtomicBool) {
     }
 }
 
+/// Whether an agent error is a TRANSIENT transport hiccup worth retrying — a
+/// dropped/garbled stream, a timeout, rate-limiting, or a server-side 5xx —
+/// rather than a deterministic failure (bad request, missing model, context or
+/// budget overflow) that a retry can't fix.
+fn is_retryable_transport(error: &AgentError) -> bool {
+    let AgentError::ModelError(e) = error else {
+        // EmptyResponse / MalformedToolCall are model-behaviour, not transport.
+        return false;
+    };
+    match e {
+        ModelError::Timeout | ModelError::RateLimited { .. } => true,
+        ModelError::ProviderError { code, message } => match code {
+            // Server-side / overload — transient.
+            408 | 429 | 500 | 502 | 503 | 504 | 529 => true,
+            // code 0 = no HTTP status: a transport- or stream-decode drop (what a
+            // flaky endpoint produces mid-stream). Gate on the stream/transport
+            // markers so we DON'T retry deterministic code-0 errors like
+            // "does not support tool calling" or "request encode failed".
+            0 => {
+                let m = message.to_ascii_lowercase();
+                m.contains("stream chunk error")
+                    || m.contains("error decoding response body")
+                    || m.contains("transport error")
+            }
+            _ => false,
+        },
+        ModelError::ContextLimitExceeded { .. } | ModelError::BudgetExceeded { .. } => false,
+        // `ModelError` is #[non_exhaustive]; default a future variant to NOT
+        // retryable so we never loop on something we don't understand.
+        _ => false,
+    }
+}
+
 /// Keep observe lines readable — file contents can be long.
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
@@ -1167,5 +1241,68 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(code: u16, message: &str) -> AgentError {
+        AgentError::ModelError(ModelError::ProviderError {
+            code,
+            message: message.into(),
+        })
+    }
+
+    #[test]
+    fn retries_the_mid_stream_decode_drop() {
+        // The exact error from the field: a transient mid-stream transport drop.
+        assert!(is_retryable_transport(&provider(
+            0,
+            "stream chunk error: error decoding response body"
+        )));
+    }
+
+    #[test]
+    fn retries_transient_classes() {
+        assert!(is_retryable_transport(&AgentError::ModelError(
+            ModelError::Timeout
+        )));
+        assert!(is_retryable_transport(&AgentError::ModelError(
+            ModelError::RateLimited { retry_after: None }
+        )));
+        for code in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(
+                is_retryable_transport(&provider(code, "server error")),
+                "code {code} should retry"
+            );
+        }
+        assert!(is_retryable_transport(&provider(
+            0,
+            "HTTP transport error: connection reset by peer"
+        )));
+    }
+
+    #[test]
+    fn does_not_retry_deterministic_failures() {
+        // code 0 but NOT a transport drop — a retry can't help.
+        assert!(!is_retryable_transport(&provider(
+            0,
+            "Model gemma4:26b does not support tool calling"
+        )));
+        assert!(!is_retryable_transport(&provider(404, "Model not found")));
+        assert!(!is_retryable_transport(&provider(400, "bad request")));
+        assert!(!is_retryable_transport(&AgentError::ModelError(
+            ModelError::ContextLimitExceeded {
+                limit: 8192,
+                actual: 9000,
+            }
+        )));
+        assert!(!is_retryable_transport(&AgentError::EmptyResponse));
+        assert!(!is_retryable_transport(&AgentError::MalformedToolCall {
+            tool_name: "bash".into(),
+            reason: "no json".into(),
+        }));
     }
 }

@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Pulled in from the sibling spore-core checkout. The harness runtime lives there;
 # this crate only architects a strategy-selectable harness on top of it.
 spore-core = { path = "../../spore-core/rust/crates/spore-core" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde_json = "1"
 # Raw-mode key input so a bare Esc can abort a running task (no Enter needed).
 crossterm = "0.28"
