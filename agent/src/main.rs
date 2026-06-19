@@ -115,46 +115,111 @@ use spore_core::model::ReasoningEffort;
 mod build_check;
 mod skills;
 
-const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
+// ============================================================================
+// System-prompt fragments + the runtime composer
+// ============================================================================
+//
+// The system prompt is NOT one constant — it is assembled per strategy from the
+// fragments below via [`PromptBuilder`], so each strategy ships exactly the
+// guidance it needs. The load-bearing case: only the plan-execute family gets
+// the "answer with a bare JSON plan" clause (PROMPT_ACT_PLAN). Baking that into a
+// shared prompt let a ReAct run end early by emitting a plan as plain text — a
+// tool-call-free turn is taken as the final answer — so the file was never
+// touched. ReAct now gets the opposite instruction (PROMPT_ACT_REACT).
+
+/// Opening: who the agent is and the tool palette. Common to every strategy.
+const PROMPT_INTRO: &str = "You are a coding agent working inside a sandboxed workspace directory. \
      Explore with list_dir, read_file, grep, and find_files; create and change files with \
      write_file and edit_file; run commands (builds, tests) with bash_command. Use `.` and \
-     relative paths only. \
-     Act using tools — do not just describe what you would do. (The one exception: when you are \
-     asked to PRODUCE A PLAN, reply with the requested JSON plan object directly, with no tool \
-     calls in that turn — make each task one concrete, self-contained step, ordered so each \
-     builds on the previous.) \
-     \
-     Work in small, VERIFIED steps. Implement ONE change at a time, then immediately verify it \
-     with bash_command: run the project's build and tests (e.g. `cargo test`) and READ the \
-     output before continuing. Let the compiler and the failing tests drive you — fix the \
-     specific error they report instead of guessing or rewriting from scratch. Prefer edit_file \
-     to change only the lines that are wrong; do NOT rewrite a whole file you have already \
-     written, which only reintroduces mistakes and truncates the output. Keep each edit scoped \
-     to the step you are on. {build_note}\
-     Do NOT declare the task done until you have run the tests and seen \
-     them pass; then reply with a short summary of what you changed. \
-     \
-     The user CANNOT see your reasoning or your tool calls — they only see the messages you \
-     send with the `send_message` tool and your final reply. So keep the user in the loop: \
-     before (or as) you act, call `send_message` with one short sentence saying what you are \
-     about to do, e.g. \"Reading the Cargo.toml to find the entry point.\" Call `send_message` \
-     in PARALLEL with the tool that does the work — emit both in the same turn — so narration \
-     never costs an extra round trip. Keep each message to a single short sentence. \
-     \
-     You may have SKILLS available — reusable, named procedures listed under AVAILABLE SKILLS \
-     in your context (each as `name: description`). When the user's request matches a skill's \
-     description, call the `load_skill` tool with that skill's name BEFORE you start, then \
-     follow the full procedure it injects. You can load more than one.";
+     relative paths only.";
 
-/// Spliced into `{build_note}` in [`SYSTEM_PROMPT`] only when the per-write build
-/// check is active (see `build_check`). Empty otherwise, so the prompt never
-/// promises feedback the tools won't deliver. Trailing space is load-bearing —
-/// it flows into the following sentence.
+/// Act directive for the **ReAct** baseline. There is no plan phase here, so the
+/// "answer with a bare JSON plan" escape hatch is deliberately ABSENT: a turn in
+/// which the model calls no tool ends the run with that text as its final answer,
+/// so emitting a plan instead of acting would finish the run having built
+/// nothing. Spelled out so a weak model can't stop at "here's my plan."
+const PROMPT_ACT_REACT: &str = "Act using tools — do not just describe what you would do. \
+     A turn in which you call NO tool ends the run immediately, with whatever text you wrote taken \
+     as your final answer — so never stop just to lay out a plan or list the steps you intend to \
+     take; keep acting until you have run the tests and seen them pass.";
+
+/// Act directive for the **plan-execute family** (plan-execute, hillclimb). Their
+/// PLAN phase is required to answer with a single JSON plan object and no tool
+/// calls, so the escape hatch belongs here — and ONLY here.
+const PROMPT_ACT_PLAN: &str = "Act using tools — do not just describe what you would do. \
+     (The one exception: when you are asked to PRODUCE A PLAN, reply with the requested JSON plan \
+     object directly, with no tool calls in that turn — make each task one concrete, \
+     self-contained step, ordered so each builds on the previous.)";
+
+/// The verify-in-small-steps discipline. Common to every strategy. The build
+/// note (when active) and [`PROMPT_DONE`] follow as their own fragments so the
+/// optional note can slot cleanly between them.
+const PROMPT_VERIFY: &str = "Work in small, VERIFIED steps. Implement ONE change at a time, then \
+     immediately verify it with bash_command: run the project's build and tests (e.g. `cargo \
+     test`) and READ the output before continuing. Let the compiler and the failing tests drive \
+     you — fix the specific error they report instead of guessing or rewriting from scratch. \
+     Prefer edit_file to change only the lines that are wrong; do NOT rewrite a whole file you \
+     have already written, which only reintroduces mistakes and truncates the output. Keep each \
+     edit scoped to the step you are on.";
+
+/// Closes the verify section. Common to every strategy; kept separate from
+/// [`PROMPT_VERIFY`] so the conditional build note can slot between them.
+const PROMPT_DONE: &str = "Do NOT declare the task done until you have run the tests and seen them \
+     pass; then reply with a short summary of what you changed.";
+
+/// Narration discipline (send_message). Common to every strategy.
+const PROMPT_NARRATION: &str = "The user CANNOT see your reasoning or your tool calls — they only \
+     see the messages you send with the `send_message` tool and your final reply. So keep the user \
+     in the loop: before (or as) you act, call `send_message` with one short sentence saying what \
+     you are about to do, e.g. \"Reading the Cargo.toml to find the entry point.\" Call \
+     `send_message` in PARALLEL with the tool that does the work — emit both in the same turn — so \
+     narration never costs an extra round trip. Keep each message to a single short sentence.";
+
+/// Skills affordance (load_skill). Common to every strategy.
+const PROMPT_SKILLS: &str = "You may have SKILLS available — reusable, named procedures listed \
+     under AVAILABLE SKILLS in your context (each as `name: description`). When the user's request \
+     matches a skill's description, call the `load_skill` tool with that skill's name BEFORE you \
+     start, then follow the full procedure it injects. You can load more than one.";
+
+/// Pushed between [`PROMPT_VERIFY`] and [`PROMPT_DONE`] only when the per-write
+/// build check is active (see `build_check`). Empty otherwise, so the prompt
+/// never promises feedback the tools won't deliver — [`PromptBuilder::push`]
+/// drops the empty fragment, leaving no stray separator.
 const BUILD_CHECK_NOTE: &str = "Note: write_file and edit_file AUTOMATICALLY compile the project \
      after each source-file change and append the result — a write that does not compile comes \
      back as an ERROR with the exact compiler diagnostics. When that happens, STOP: fix that \
      specific error with a small edit_file before doing anything else; do not pile on more changes \
-     or rewrite the file. ";
+     or rewrite the file.";
+
+/// Composes a system prompt from ordered fragments at runtime, so each strategy
+/// can assemble exactly the guidance it needs rather than share one monolith.
+/// Empty/whitespace-only fragments are dropped, so an optional fragment (a build
+/// note that's switched off) can be pushed unconditionally without leaving a
+/// double space or a dangling separator behind.
+#[derive(Default)]
+struct PromptBuilder {
+    fragments: Vec<String>,
+}
+
+impl PromptBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a fragment, ignoring an empty/whitespace-only one.
+    fn push(mut self, fragment: impl Into<String>) -> Self {
+        let fragment = fragment.into();
+        if !fragment.trim().is_empty() {
+            self.fragments.push(fragment);
+        }
+        self
+    }
+
+    /// Join the fragments with a single space into the final prompt.
+    fn build(self) -> String {
+        self.fragments.join(" ")
+    }
+}
 
 /// Per-loop ReAct step budget for EACH execute-phase task (04 used 8; a coding
 /// task wants more room to explore, edit, and verify). The plan phase runs under
@@ -389,7 +454,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         ""
     };
-    let system_prompt = SYSTEM_PROMPT.replace("{build_note}", build_note);
+    // Compose the prompt for the chosen strategy: the ReAct baseline omits the
+    // "answer with a bare JSON plan" clause that only the plan-execute family's
+    // plan phase needs (see the fragment block above).
+    let system_prompt = strategy.system_prompt(build_note);
 
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model)
@@ -813,6 +881,32 @@ impl Strategy {
             Strategy::PlanExecute => plan_execute_strategy(),
             Strategy::HillClimb => hillclimb_strategy(),
         }
+    }
+
+    /// The act directive for this strategy. Only the plan-execute family — whose
+    /// PLAN phase must answer with a bare JSON plan — gets the escape hatch; the
+    /// ReAct baseline gets the opposite instruction, because there a tool-call-
+    /// free turn ENDS the run (and so emitting a plan would build nothing).
+    fn act_directive(self) -> &'static str {
+        match self {
+            Strategy::React => PROMPT_ACT_REACT,
+            Strategy::PlanExecute | Strategy::HillClimb => PROMPT_ACT_PLAN,
+        }
+    }
+
+    /// Compose this strategy's system prompt from the shared fragments plus its
+    /// own act directive. `build_note` is the (possibly empty) per-write build-
+    /// check note; an empty one is dropped by [`PromptBuilder::push`].
+    fn system_prompt(self, build_note: &str) -> String {
+        PromptBuilder::new()
+            .push(PROMPT_INTRO)
+            .push(self.act_directive())
+            .push(PROMPT_VERIFY)
+            .push(build_note)
+            .push(PROMPT_DONE)
+            .push(PROMPT_NARRATION)
+            .push(PROMPT_SKILLS)
+            .build()
     }
 }
 
@@ -1360,5 +1454,34 @@ mod tests {
             tool_name: "bash".into(),
             reason: "no json".into(),
         }));
+    }
+
+    /// The leak that ended a ReAct run early: only the plan-execute family may
+    /// carry the "answer with a bare JSON plan" clause. ReAct must NOT — there a
+    /// tool-call-free turn is the final answer, so a plan would build nothing.
+    #[test]
+    fn react_prompt_omits_the_plan_escape_hatch() {
+        let react = Strategy::React.system_prompt("");
+        assert!(
+            !react.contains("PRODUCE A PLAN"),
+            "ReAct prompt must not invite a bare-JSON-plan answer"
+        );
+        for plan_family in [Strategy::PlanExecute, Strategy::HillClimb] {
+            assert!(
+                plan_family.system_prompt("").contains("PRODUCE A PLAN"),
+                "{plan_family:?} plan phase needs the JSON-plan clause"
+            );
+        }
+    }
+
+    /// The build note is spliced in only when the per-write check is on, and
+    /// pushing an empty note leaves no dangling separator behind.
+    #[test]
+    fn build_note_is_conditional_and_leaves_no_double_space() {
+        let without = Strategy::React.system_prompt("");
+        let with = Strategy::React.system_prompt(BUILD_CHECK_NOTE);
+        assert!(!without.contains("AUTOMATICALLY compile"));
+        assert!(with.contains("AUTOMATICALLY compile"));
+        assert!(!without.contains("  "), "empty fragment left a double space");
     }
 }
