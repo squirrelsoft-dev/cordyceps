@@ -112,6 +112,7 @@ use spore_core::{
 // crate root like `ModelParams` is, so reach it through the public `model` module.
 use spore_core::model::ReasoningEffort;
 
+mod build_check;
 mod skills;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
@@ -129,7 +130,8 @@ const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed w
      specific error they report instead of guessing or rewriting from scratch. Prefer edit_file \
      to change only the lines that are wrong; do NOT rewrite a whole file you have already \
      written, which only reintroduces mistakes and truncates the output. Keep each edit scoped \
-     to the step you are on. Do NOT declare the task done until you have run the tests and seen \
+     to the step you are on. {build_note}\
+     Do NOT declare the task done until you have run the tests and seen \
      them pass; then reply with a short summary of what you changed. \
      \
      The user CANNOT see your reasoning or your tool calls — they only see the messages you \
@@ -143,6 +145,16 @@ const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed w
      in your context (each as `name: description`). When the user's request matches a skill's \
      description, call the `load_skill` tool with that skill's name BEFORE you start, then \
      follow the full procedure it injects. You can load more than one.";
+
+/// Spliced into `{build_note}` in [`SYSTEM_PROMPT`] only when the per-write build
+/// check is active (see `build_check`). Empty otherwise, so the prompt never
+/// promises feedback the tools won't deliver. Trailing space is load-bearing —
+/// it flows into the following sentence.
+const BUILD_CHECK_NOTE: &str = "Note: write_file and edit_file AUTOMATICALLY compile the project \
+     after each source-file change and append the result — a write that does not compile comes \
+     back as an ERROR with the exact compiler diagnostics. When that happens, STOP: fix that \
+     specific error with a small edit_file before doing anything else; do not pile on more changes \
+     or rewrite the file. ";
 
 /// Per-loop ReAct step budget for EACH execute-phase task (04 used 8; a coding
 /// task wants more room to explore, edit, and verify). The plan phase runs under
@@ -351,14 +363,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog.manifest(),
     ));
 
+    // Per-write build feedback: wrap `write_file` / `edit_file` so each source
+    // write is immediately compiled and the compiler's verdict folded into the
+    // tool result. This makes compile feedback UNAVOIDABLE — the model can no
+    // longer barrel past a broken write the way prompt guidance alone allowed
+    // (the documented rewrite-spiral failure). Off with CORDYCEPS_BUILD_CHECK=off;
+    // see `build_check`.
+    let build_check = build_check::BuildCheck::from_env();
+    let coding_tools: Vec<_> = match build_check.as_ref() {
+        Some(check) => {
+            let check = Arc::new(check.clone());
+            StandardTools::coding_set()
+                .into_iter()
+                .map(|t| build_check::wrap_write_tool(t, &check))
+                .collect()
+        }
+        None => StandardTools::coding_set(),
+    };
+
+    // Only promise the auto-compile feedback in the prompt when it is actually
+    // wired (otherwise the model would skip its own verification trusting a
+    // safety net that's off).
+    let build_note = if build_check.is_some() {
+        BUILD_CHECK_NOTE
+    } else {
+        ""
+    };
+    let system_prompt = SYSTEM_PROMPT.replace("{build_note}", build_note);
+
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model)
         .sandbox(sandbox.clone())
-        // The coding catalogue PLUS the architect-side `load_skill` tool, so the
-        // agent can pull a skill's full procedure into context on demand.
-        .tools(StandardTools::coding_set())
+        // The coding catalogue (with build-checked write/edit) PLUS the
+        // architect-side `load_skill` tool, so the agent can pull a skill's full
+        // procedure into context on demand.
+        .tools(coding_tools)
         .tool(skills::load_skill_tool(active.clone(), known.clone()))
-        .system_prompt(SYSTEM_PROMPT)
+        .system_prompt(system_prompt)
         // Request the model's reasoning pass at the chosen effort level.
         // spore-core's Ollama client maps `reasoning_effort` to
         // `think: "low"|"medium"|"high"|"max"` (gated on the model's `"thinking"`
@@ -412,6 +453,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "tools     : read_file, write_file, edit_file, list_dir, grep, find_files, bash, load_skill, …"
     );
+    match build_check.as_ref() {
+        Some(check) => println!("build-chk : {}", check.banner()),
+        None => println!("build-chk : off"),
+    }
     println!(
         "skills    : {} discovered — load with /<name>, or the agent loads via load_skill (/skills to list)",
         known.len()
