@@ -107,6 +107,10 @@ use spore_core::{
     ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
+// `ReasoningEffort` is a `ModelParams` field type but isn't re-exported at the
+// crate root like `ModelParams` is, so reach it through the public `model` module.
+use spore_core::model::ReasoningEffort;
+
 mod skills;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
@@ -194,15 +198,15 @@ const DEFAULT_CONTEXT_WINDOW: u32 = 256_000;
 /// it. This is `CompactionConfig`'s own default; we name it for clarity.
 const COMPACT_THRESHOLD: f32 = 0.80;
 
-/// Default reasoning budget when reasoning isn't explicitly configured. gemma4
-/// is a reasoning model, so we ask for its thinking pass by default. For Ollama
-/// the magnitude is irrelevant — any positive value maps to `think: true` (the
-/// spore-core client gates that on the model's `"thinking"` capability, so a
-/// non-reasoning model silently no-ops). Set `--reasoning 0` /
-/// `SPORE_REASONING_BUDGET=0` to turn it off (e.g. to reproduce a pre-reasoning
-/// ledger run). The value is carried as an Anthropic-style token budget so the
-/// same knob ports if the backend ever changes.
-const DEFAULT_REASONING_BUDGET: u32 = 2048;
+/// Default reasoning effort when it isn't explicitly configured. gemma4 is a
+/// reasoning model that OVER-reasons at full depth (`think: true` ran away for
+/// ~10 min on one task), so we default to the bounded `low` level — it reduces
+/// reasoning depth gracefully and still answers, unlike a hard token cap which
+/// truncates the tool call mid-thought. Raise to medium/high/max for harder
+/// tasks, or `off` to disable (e.g. to reproduce a pre-reasoning ledger run).
+/// spore-core gates the level on the model's `"thinking"` capability, so a
+/// non-reasoning model silently no-ops.
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
 // ANSI styling for the REPL trace. The `send_message` narration is the group
 // SECTION HEADER — bright white and flush left, so it stands out as the one line
@@ -250,17 +254,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-    // Reasoning is ON by default (gemma4 is a reasoning model). An explicit
-    // `--reasoning 0` / `SPORE_REASONING_BUDGET=0` disables it; an unparseable
-    // value falls back to the default rather than silently turning it off.
-    let reasoning_budget: Option<u32> = match arg_value(&args, "--reasoning")
-        .or_else(|| std::env::var("SPORE_REASONING_BUDGET").ok())
+    // Reasoning effort level (gemma4 / gpt-oss-style: low|medium|high|max, or
+    // off). `--reasoning <level>` / `SPORE_REASONING_EFFORT`. Unset → the bounded
+    // default; an unknown value also falls back to the default (the banner echoes
+    // the level in effect, so a typo is visible rather than silently disabling).
+    let reasoning_effort: Option<ReasoningEffort> = match arg_value(&args, "--reasoning")
+        .or_else(|| std::env::var("SPORE_REASONING_EFFORT").ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
     {
-        Some(s) => {
-            let n = s.parse::<u32>().unwrap_or(DEFAULT_REASONING_BUDGET);
-            (n > 0).then_some(n)
-        }
-        None => Some(DEFAULT_REASONING_BUDGET),
+        Some("off" | "none" | "false" | "0") => None,
+        Some("low") => Some(ReasoningEffort::Low),
+        Some("medium" | "med") => Some(ReasoningEffort::Medium),
+        Some("high") => Some(ReasoningEffort::High),
+        Some("max") => Some(ReasoningEffort::Max),
+        _ => Some(DEFAULT_REASONING_EFFORT),
     };
 
     // The agent operates inside a writable workspace root. By DEFAULT this is the
@@ -333,12 +341,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools(StandardTools::coding_set())
         .tool(skills::load_skill_tool(active.clone(), known.clone()))
         .system_prompt(SYSTEM_PROMPT)
-        // Request the model's reasoning pass. spore-core's Ollama client turns a
-        // positive `reasoning_budget` into `think: true` for thinking-capable
-        // models and surfaces the trace as `ReasoningDelta` stream events, which
-        // the sink prints live. Everything else stays at `ModelParams::default`.
+        // Request the model's reasoning pass at the chosen effort level.
+        // spore-core's Ollama client maps `reasoning_effort` to
+        // `think: "low"|"medium"|"high"|"max"` (gated on the model's `"thinking"`
+        // capability) and surfaces the trace as `ReasoningDelta` stream events,
+        // which the sink prints live. Everything else stays at `ModelParams::default`.
         .model_params(ModelParams {
-            reasoning_budget,
+            reasoning_effort,
             ..Default::default()
         })
         .context_manager(context_manager)
@@ -363,9 +372,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("model     : {model_id}");
     println!(
         "reasoning : {}",
-        match reasoning_budget {
-            Some(n) => format!("on (budget {n} → think:true on thinking-capable models)"),
-            None => "off (--reasoning <n> or $SPORE_REASONING_BUDGET to enable)".to_string(),
+        match reasoning_effort {
+            Some(ReasoningEffort::Low) => "low → think:\"low\" on thinking-capable models",
+            Some(ReasoningEffort::Medium) => "medium → think:\"medium\"",
+            Some(ReasoningEffort::High) => "high → think:\"high\"",
+            Some(ReasoningEffort::Max) => "max → think:\"max\"",
+            None => "off (--reasoning low|medium|high|max or $SPORE_REASONING_EFFORT)",
         }
     );
     println!("strategy  : {}", strategy.banner());
@@ -904,8 +916,8 @@ OPTIONS:
     --model <id>          Ollama model (default: gemma4:e4b, or $SPORE_OLLAMA_MODEL)
     --workspace <path>    workspace root the agent reads/writes (default: cwd)
     --context-window <n>  compaction window in tokens (default: 256000)
-    --reasoning <budget>  request the model's reasoning pass (default: 2048;
-                          0 disables; or $SPORE_REASONING_BUDGET)
+    --reasoning <level>   thinking effort: off|low|medium|high|max
+                          (default: low; or $SPORE_REASONING_EFFORT)
     --help, -h            show this message
 
 EXAMPLES (run from the cordyceps repo root):
