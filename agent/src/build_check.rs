@@ -1,5 +1,6 @@
-//! Build-checked write tools — make compile feedback *unavoidable* by coupling it
-//! to the write itself.
+//! Build-checked writes — make compile feedback *unavoidable* by running the
+//! configured build after every source write and folding the verdict into the
+//! tool result the model sees.
 //!
 //! ## Why this exists
 //!
@@ -9,36 +10,38 @@
 //! `write_file` that *succeeds* (bytes hit disk) returns a cheerful "wrote N
 //! bytes" — regardless of whether the result compiles. Prompt guidance to
 //! "verify each change with the build" was ignored; the success message gave the
-//! model no reason to stop. The harness can't catch this either: the loop-wired
-//! `AfterTool` middleware (`harness.rs`) can only *halt* the run, not feed the
-//! compiler's verdict back, and the per-tool `PostToolUse` hook is not fired in
-//! the loop. So the only place to make the feedback inescapable is the **tool
-//! boundary**.
+//! model no reason to stop. So the feedback has to be wired into the loop itself.
 //!
 //! ## What it does
 //!
-//! [`wrap_write_tool`] wraps the catalogue's real `write_file` / `edit_file`
-//! [`Tool`] in a [`BuildCheckedTool`] that:
-//!   1. delegates the actual write/edit to the inner tool (so write semantics,
-//!      schema, and the tool name the model already calls are reused verbatim —
-//!      no reimplementation, no schema drift);
-//!   2. if the write *succeeded* and touched a source file (suffix-matched), runs
-//!      a configured build command through the sandbox; and
-//!   3. folds the verdict into the result the model sees: a clean build appends a
-//!      one-line OK; a failed build **replaces the success with a recoverable
+//! [`BuildCheckMiddleware`] is an `AfterTool` [`Middleware`]. After each tool
+//! batch the harness hands it the calls plus their (mutable) results, and it:
+//!   1. finds the writes that *succeeded* and touched a source file (a
+//!      `write_file`/`edit_file` whose `path` matches the trigger suffix);
+//!   2. if any, runs the configured build command ONCE through the sandbox
+//!      (a multi-file batch still compiles the crate a single time); and
+//!   3. folds the verdict into each matching result: a clean build appends a
+//!      one-line OK; a failed build **rewrites the success into a recoverable
 //!      [`ToolOutput::error`]** carrying the compiler diagnostics and a strict
 //!      instruction to fix it with a small `edit_file` rather than another rewrite.
 //!
-//! Returning an *error* on a broken write (even though the bytes landed) is the
+//! Rewriting a broken write into an *error* (even though the bytes landed) is the
 //! point: it surfaces as an `obs(err)` the model is trained to react to, and it
 //! resets to `Success` only once the file actually compiles.
+//!
+//! This was previously a tool-boundary wrapper (T3.3), built on the premise that
+//! the loop's `AfterTool` hook could only *halt*. That premise no longer holds:
+//! the rich `AfterTool` middleware chain is now loop-wired (Phase 3, `harness.rs`
+//! fires it and applies result rewrites). So the verdict is delivered here, as a
+//! legitimate middleware result-rewrite that composes with the preset's own tools
+//! instead of wrapping and re-supplying them.
 //!
 //! ## Configuration (the build command is NOT hardcoded)
 //!
 //! `cargo` does not generalise, so the command is read from the environment with
 //! a cordyceps-appropriate default (see [`BuildCheck::from_env`]):
 //!   - `CORDYCEPS_BUILD_CHECK=off` (or `0`/`false`/`no`) disables the feature
-//!     entirely — the stock tools are used unchanged.
+//!     entirely — no middleware is registered and the stock tools are used.
 //!   - `CORDYCEPS_BUILD_CMD` — the full build command line (whitespace-split;
 //!     first token is the program). Default:
 //!     `cargo check --all-targets --manifest-path csv-task/Cargo.toml` — `check`
@@ -52,7 +55,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spore_core::harness::{BoxFut, SandboxProvider};
-use spore_core::{truncate_field, StandardTool, Tool, ToolCall, ToolContext, ToolOutput};
+use spore_core::{
+    truncate_field, HookPoint, Middleware, MiddlewareDecision, MiddlewareHookContext,
+    SandboxViolation, ToolOutput,
+};
 
 /// How long to wait for the build before giving up and reporting "could not
 /// verify" (rather than punishing the model for a slow/hung compile).
@@ -63,7 +69,7 @@ const BUILD_TIMEOUT_SECS: u64 = 120;
 /// "aborting due to N previous errors").
 const MAX_DIAG_CHARS: usize = 6000;
 
-/// The configured post-write build check. Cloned per wrapped tool; cheap.
+/// The configured post-write build check. Cloned into the middleware; cheap.
 #[derive(Clone)]
 pub struct BuildCheck {
     /// Build program, e.g. `cargo`.
@@ -78,7 +84,7 @@ pub struct BuildCheck {
 impl BuildCheck {
     /// Resolve the build check from the environment. Returns `None` when disabled
     /// (`CORDYCEPS_BUILD_CHECK=off`) or when the command line is empty, in which
-    /// case the caller leaves the stock tools untouched.
+    /// case the caller registers no middleware and leaves the stock tools alone.
     pub fn from_env() -> Option<Self> {
         let enabled = std::env::var("CORDYCEPS_BUILD_CHECK")
             .map(|v| {
@@ -129,101 +135,142 @@ impl BuildCheck {
     }
 }
 
-/// A [`Tool`] that runs `inner` (the real `write_file` / `edit_file`) and then,
-/// on a successful source-file write, builds the project and reports the result.
-struct BuildCheckedTool {
-    inner: Box<dyn Tool>,
-    check: Arc<BuildCheck>,
+/// `AfterTool` middleware that compiles the project after a successful source
+/// write and folds the verdict into the result the model sees. Captures the
+/// `sandbox` because the `AfterTool` hook context carries none of its own.
+pub struct BuildCheckMiddleware {
+    check: BuildCheck,
+    sandbox: Arc<dyn SandboxProvider>,
 }
 
-impl Tool for BuildCheckedTool {
-    fn name(&self) -> &str {
-        self.inner.name()
+impl BuildCheckMiddleware {
+    pub fn new(check: BuildCheck, sandbox: Arc<dyn SandboxProvider>) -> Self {
+        Self { check, sandbox }
     }
 
-    fn execute<'a>(
-        &'a self,
-        call: &'a ToolCall,
-        sandbox: &'a (dyn SandboxProvider + 'a),
-        ctx: &'a ToolContext,
-    ) -> BoxFut<'a, ToolOutput> {
+    /// Run the configured build once and classify the outcome.
+    ///
+    /// SC-15 (Phase 4): a spawn failure is now a typed `Err(ExecSpawnFailed)`
+    /// (it used to surface as `Ok { exit_code: -1 }`), so it folds into the `Err`
+    /// arm here. A timeout is still `Ok { timed_out: true }`, and a signal kill
+    /// (e.g. `kill_on_drop` reaping the build when the run future is dropped) is
+    /// still `Ok { exit_code: -1, timed_out: false }`.
+    async fn run_build(&self, cmdline: &str) -> Verdict {
+        let out = match self
+            .sandbox
+            .execute_command(
+                &self.check.program,
+                &self.check.args,
+                None, // workspace root, matching the held-out evaluator
+                Some(self.check.timeout),
+            )
+            .await
+        {
+            Ok(out) => out,
+            // The build couldn't even be launched. Don't punish the model for an
+            // infra problem — note it and leave the write a Success.
+            Err(SandboxViolation::ExecSpawnFailed { message, .. }) => {
+                return Verdict::Append(format!(
+                    "[build-check skipped: `{cmdline}` did not run — {message}]"
+                ));
+            }
+            Err(other) => {
+                return Verdict::Append(format!(
+                    "[build-check skipped: could not run `{cmdline}`: {other:?}]"
+                ));
+            }
+        };
+
+        if out.timed_out {
+            return Verdict::Append(format!(
+                "[build-check: `{cmdline}` timed out after {}s — compilation not verified]",
+                self.check.timeout.as_secs()
+            ));
+        }
+        // A signal kill (no exit status) is infra, not the model's code.
+        if out.exit_code == -1 {
+            return Verdict::Append(format!("[build-check skipped: `{cmdline}` killed]"));
+        }
+        if out.exit_code == 0 {
+            return Verdict::Append(format!(
+                "✓ build OK — `{cmdline}` compiles cleanly."
+            ));
+        }
+        let diag = truncate_field(&combined_diagnostics(&out.stderr, &out.stdout), MAX_DIAG_CHARS).0;
+        Verdict::Fail(format!(
+            "✗ BUILD FAILED — the project no longer compiles after this write. Do not \
+             proceed. Fix the errors below with a SMALL, TARGETED edit_file (re-read the \
+             exact lines first if unsure); do NOT rewrite the whole file.\n\n\
+             $ {cmdline}\n{diag}"
+        ))
+    }
+}
+
+impl Middleware for BuildCheckMiddleware {
+    fn name(&self) -> &str {
+        "build-check"
+    }
+
+    fn hooks(&self) -> Vec<HookPoint> {
+        vec![HookPoint::AfterTool]
+    }
+
+    fn handle<'a>(&'a self, ctx: MiddlewareHookContext<'a>) -> BoxFut<'a, MiddlewareDecision> {
         Box::pin(async move {
-            // 1. Do the real write/edit first.
-            let inner_out = self.inner.execute(call, sandbox, ctx).await;
-
-            // Only build-check a write that actually succeeded. A failed write
-            // (sandbox violation, bad params) or a HITL pause passes through
-            // untouched — there is nothing new on disk to compile.
-            let write_msg = match &inner_out {
-                ToolOutput::Success { content, .. } => content.clone(),
-                _ => return inner_out,
+            let MiddlewareHookContext::AfterTool { calls, results } = ctx else {
+                return MiddlewareDecision::Continue;
             };
 
-            // 2. Source files only — skip docs, configs, fixtures, etc.
-            let path = call
-                .input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if !path.ends_with(&self.check.trigger_suffix) {
-                return inner_out;
-            }
-
-            // 3. Build, and fold the verdict into the result.
-            let cmdline = self.check.cmdline();
-            let out = match sandbox
-                .execute_command(
-                    &self.check.program,
-                    &self.check.args,
-                    None, // workspace root, matching the held-out evaluator
-                    Some(self.check.timeout),
-                )
-                .await
-            {
-                Ok(o) => o,
-                // The build couldn't even be launched. Don't lose the write or
-                // punish the model for an infra problem — note it and move on.
-                Err(v) => {
-                    return ToolOutput::success(format!(
-                        "{write_msg}\n\n[build-check skipped: could not run `{cmdline}`: {v:?}]"
-                    ));
+            // The writes that landed bytes on a source file — the only ones worth
+            // compiling. Keep each one's original success message; we prepend it to
+            // the verdict so the model still sees "wrote N bytes" plus the build.
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for (i, (call, result)) in calls.iter().zip(results.iter()).enumerate() {
+                if !matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    continue;
                 }
-            };
-
-            if out.timed_out {
-                return ToolOutput::success(format!(
-                    "{write_msg}\n\n[build-check: `{cmdline}` timed out after {}s — \
-                     compilation not verified]",
-                    self.check.timeout.as_secs()
-                ));
+                // Only a write that actually succeeded — a failed write or a HITL
+                // pause has nothing new on disk to compile.
+                let ToolOutput::Success { content, .. } = &result.output else {
+                    continue;
+                };
+                let path = call
+                    .input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !path.ends_with(&self.check.trigger_suffix) {
+                    continue;
+                }
+                targets.push((i, content.clone()));
+            }
+            if targets.is_empty() {
+                return MiddlewareDecision::Continue;
             }
 
-            // A spawn failure (program not found) or a signal kill surfaces as
-            // exit_code -1 INSIDE Ok(..) — the sandbox never returns Err for it.
-            // That's an infra problem, not the model's code: skip rather than
-            // falsely reporting the write as a compile failure.
-            if out.exit_code == -1 {
-                let why = truncate_field(&combined_diagnostics(&out.stderr, &out.stdout), 400).0;
-                return ToolOutput::success(format!(
-                    "{write_msg}\n\n[build-check skipped: `{cmdline}` did not run ({why})]"
-                ));
+            // Build ONCE for the whole batch; fold the same verdict into each write.
+            let cmdline = self.check.cmdline();
+            let verdict = self.run_build(&cmdline).await;
+            for (i, write_msg) in targets {
+                results[i].output = match &verdict {
+                    Verdict::Append(note) => ToolOutput::success(format!("{write_msg}\n\n{note}")),
+                    Verdict::Fail(body) => ToolOutput::error(format!("{write_msg}\n\n{body}")),
+                };
             }
-
-            if out.exit_code == 0 {
-                ToolOutput::success(format!("{write_msg}\n\n✓ build OK — `{cmdline}` compiles cleanly."))
-            } else {
-                let diag =
-                    truncate_field(&combined_diagnostics(&out.stderr, &out.stdout), MAX_DIAG_CHARS).0;
-                ToolOutput::error(format!(
-                    "{write_msg}\n\n\
-                     ✗ BUILD FAILED — the project no longer compiles after this write. Do not \
-                     proceed. Fix the errors below with a SMALL, TARGETED edit_file (re-read the \
-                     exact lines first if unsure); do NOT rewrite the whole file.\n\n\
-                     $ {cmdline}\n{diag}"
-                ))
-            }
+            MiddlewareDecision::ContinueWithModification
         })
     }
+}
+
+/// What the build said, ready to fold into a write result.
+enum Verdict {
+    /// Keep the write a `Success`; append this note. Used for a clean build and
+    /// for infra skips (spawn failure, timeout, signal kill) that must not punish
+    /// the model for a problem its code didn't cause.
+    Append(String),
+    /// Rewrite the write into a recoverable [`ToolOutput::error`] carrying this
+    /// body — the compiler said no.
+    Fail(String),
 }
 
 /// Prefer stderr (where rustc/cargo write diagnostics); fall back to stdout if
@@ -237,23 +284,117 @@ fn combined_diagnostics(stderr: &str, stdout: &str) -> String {
     }
 }
 
-/// Wrap `tool` in build-checking iff it is `write_file` or `edit_file`; otherwise
-/// return it unchanged. The inner implementation and schema are reused verbatim,
-/// so the model keeps calling the same tools by the same names.
-pub fn wrap_write_tool(tool: StandardTool, check: &Arc<BuildCheck>) -> StandardTool {
-    if matches!(tool.schema.name.as_str(), "write_file" | "edit_file") {
-        let StandardTool {
-            implementation,
-            schema,
-        } = tool;
-        StandardTool::new(
-            Box::new(BuildCheckedTool {
-                inner: implementation,
-                check: check.clone(),
-            }),
-            schema,
-        )
-    } else {
-        tool
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    // The `AfterTool` results vector is the HARNESS-side tool result
+    // (`call_id` + `output`), exported as `HarnessToolResult` to avoid clashing
+    // with the model-side `ToolResult` (`tool_use_id` + `content` + `is_error`).
+    use spore_core::{HarnessToolResult, ToolCall, WorkspaceConfig, WorkspaceScopedSandbox};
+
+    /// Fire the middleware over a single successful `write_file` to a `.rs` path,
+    /// using `program` as the build command, and return the rewritten output.
+    /// `true`/`false` stand in for a clean/failing compile (exit 0 vs 1) so the
+    /// test needs no real crate on disk — the build verdict, not its contents,
+    /// is what we assert on.
+    async fn verdict_for(program: &str) -> ToolOutput {
+        let sandbox = Arc::new(
+            WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(std::env::temp_dir())).unwrap(),
+        );
+        let check = BuildCheck {
+            program: program.to_string(),
+            args: vec![],
+            trigger_suffix: ".rs".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mw = BuildCheckMiddleware::new(check, sandbox);
+
+        let calls = vec![ToolCall {
+            id: "c1".to_string(),
+            name: "write_file".to_string(),
+            input: json!({ "path": "csv-task/src/lib.rs" }),
+        }];
+        let mut results = vec![HarnessToolResult {
+            call_id: "c1".to_string(),
+            output: ToolOutput::success("wrote 12 bytes"),
+        }];
+
+        let decision = mw
+            .handle(MiddlewareHookContext::AfterTool {
+                calls: &calls,
+                results: &mut results,
+            })
+            .await;
+        assert!(matches!(
+            decision,
+            MiddlewareDecision::ContinueWithModification
+        ));
+        results.pop().unwrap().output
+    }
+
+    // `true` exits 0 → the write stays a Success with a build-OK line appended,
+    // and the original write message is preserved.
+    #[tokio::test]
+    async fn clean_build_appends_ok_and_keeps_success() {
+        match verdict_for("true").await {
+            ToolOutput::Success { content, .. } => {
+                assert!(
+                    content.contains("wrote 12 bytes"),
+                    "original write message lost: {content}"
+                );
+                assert!(content.contains("✓ build OK"), "missing build-OK line: {content}");
+            }
+            _ => panic!("a clean build must keep the write a Success"),
+        }
+    }
+
+    // `false` exits 1 → the write is rewritten into a recoverable error.
+    #[tokio::test]
+    async fn failed_build_rewrites_to_recoverable_error() {
+        match verdict_for("false").await {
+            ToolOutput::Error { recoverable, .. } => {
+                assert!(recoverable, "a build-failure error must be recoverable");
+            }
+            _ => panic!("a failed build must rewrite the write into an Error"),
+        }
+    }
+
+    // A non-source write (no `.rs` suffix) is left completely alone.
+    #[tokio::test]
+    async fn non_source_write_is_untouched() {
+        let sandbox = Arc::new(
+            WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(std::env::temp_dir())).unwrap(),
+        );
+        // `false` would fail if it ran — it must NOT run for a non-.rs path.
+        let check = BuildCheck {
+            program: "false".to_string(),
+            args: vec![],
+            trigger_suffix: ".rs".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mw = BuildCheckMiddleware::new(check, sandbox);
+
+        let calls = vec![ToolCall {
+            id: "c1".to_string(),
+            name: "write_file".to_string(),
+            input: json!({ "path": "notes.md" }),
+        }];
+        let mut results = vec![HarnessToolResult {
+            call_id: "c1".to_string(),
+            output: ToolOutput::success("wrote 3 bytes"),
+        }];
+
+        let decision = mw
+            .handle(MiddlewareHookContext::AfterTool {
+                calls: &calls,
+                results: &mut results,
+            })
+            .await;
+        assert!(matches!(decision, MiddlewareDecision::Continue));
+        match &results[0].output {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "wrote 3 bytes"),
+            _ => panic!("a non-source write must be left untouched"),
+        }
     }
 }

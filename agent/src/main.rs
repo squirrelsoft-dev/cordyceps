@@ -41,13 +41,17 @@
 //!   the new prompt is appended on top. So the agent remembers the dialogue, not
 //!   just what's on disk. (Type `clear` to reset the conversation; the
 //!   conversational `ContextManager` compacts it when the window fills.)
-//! - **Auto-continue on a budget pause.** A node's step budget is finite, so a
-//!   long task can spend it mid-flight. The conversational harness then PAUSES
-//!   (`WaitingForHuman { BudgetExhausted }` — its default
-//!   `EscalationMode::SurfaceToHuman`). The REPL answers that pause itself,
-//!   resuming with a `ContinueWithBudget` grant up to [`MAX_AUTO_CONTINUES`] times
-//!   so the plan gets worked to completion without you babysitting it. The resume
-//!   re-seeds the stalled worker, so no work is lost (see [`drive`]).
+//! - **Auto-continue on a spent budget — in the harness, not the consumer.** A
+//!   node's step budget is finite, so a long task can spend it mid-flight. Both
+//!   harness presets ([`HarnessBuilder::coding_agent`] /
+//!   [`HarnessBuilder::hill_climber`]) set `EscalationMode::AutoContinue` (SC-5),
+//!   so the harness grants more budget IN-PROCESS and keeps working — up to
+//!   [`HarnessBuilder::PRESET_MAX_AUTO_GRANTS`] grants of
+//!   [`HarnessBuilder::PRESET_STEPS_PER_GRANT`] steps — re-seeding the stalled
+//!   worker so no work is lost. There is no consumer-side drive/resume loop:
+//!   `harness.run(..)` returns a terminal result directly. (Past the cap it ends
+//!   with `Failure`; the durable, project-scoped task list still holds the rest,
+//!   so a follow-up prompt resumes it.)
 //! - **A real coding sandbox.** Catalogue file tools go through a
 //!   [`WorkspaceScopedSandbox`] scoped to the workspace ROOT — by default the
 //!   directory you launched from, so running at your project root lets the agent
@@ -65,8 +69,10 @@
 //!   description) of it every turn, pulling the full body into context only when
 //!   it calls the `load_skill` tool — or when you load it yourself with `/<name>`.
 //!   It follows the [Agent Skills spec](https://agentskills.io/specification),
-//!   wired example-side by wrapping the context manager (see [`skills`]); issue
-//!   #115 will productionize it in the harness.
+//!   now productionized in the harness (#115 / SC-26): [`HarnessBuilder::skills`]
+//!   takes a [`spore_core::SkillCatalog`], registers `load_skill`, and injects the
+//!   manifest + active bodies STRUCTURALLY via the rich `ContextSources` seam — no
+//!   example-side context-manager wrapper.
 //! - **Esc-to-abort, without losing context.** A run executes with the terminal
 //!   in raw mode and a background key watcher; pressing Esc drops the
 //!   `harness.run(..)` future, cancelling the in-flight turn at its next await
@@ -95,17 +101,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spore_core::{
-    AgentError, AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content,
-    EscalationAction,
-    FunctionHook, HaltReason, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
-    HarnessStreamEvent, HillClimbingConfig, HillClimbingDirection, HookChain, HookContext,
-    HookDecision, HookEvent, HumanRequest, HumanResponse, LoopStrategy, Message, MetricError,
-    MetricEvaluator, MetricResult, ModelError, ModelParams, NullCacheProvider, OllamaModelInterface,
-    PlanExecuteConfig,
-    ReactConfig, Role, RunResult,
-    SchemaRef, SessionId, SessionState, SessionStateSnapshot, StandardContextManager,
-    StandardHookChain, StandardTools, Task, TaskId, TestPassRateEvaluator, ToolCall, ToolResult,
-    ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
+    AgentError, AgentRef, BudgetExhaustedBehavior, BudgetPolicy, Content, FunctionHook,
+    GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent,
+    HillClimbingConfig, HillClimbingDirection, HookChain, HookContext, HookDecision, HookEvent,
+    LoopStrategy, Message, MetricError, MetricEvaluator, MetricResult, MiddlewareChain, ModelParams,
+    OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult, SessionId, SessionState,
+    SessionStateSnapshot, StandardHookChain, StandardMiddlewareChain, StandardTools, Task, TaskId,
+    TestPassRateEvaluator, ToolCall, ToolResult, ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 // `ReasoningEffort` is a `ModelParams` field type but isn't re-exported at the
@@ -113,39 +115,47 @@ use spore_core::{
 use spore_core::model::ReasoningEffort;
 
 mod build_check;
-mod skills;
 
 // ============================================================================
 // System-prompt fragments + the runtime composer
 // ============================================================================
 //
-// The system prompt is NOT one constant — it is assembled per strategy from the
-// fragments below via [`PromptBuilder`], so each strategy ships exactly the
-// guidance it needs. The load-bearing case: only the plan-execute family gets
-// the "answer with a bare JSON plan" clause (PROMPT_ACT_PLAN). Baking that into a
-// shared prompt let a ReAct run end early by emitting a plan as plain text — a
-// tool-call-free turn is taken as the final answer — so the file was never
-// touched. ReAct now gets the opposite instruction (PROMPT_ACT_REACT).
+// There is ONE base operating prompt ([`base_system_prompt`]), shared by every
+// strategy AND by the plan-execute family's EXECUTE phase — it carries the ReAct
+// act directive (PROMPT_ACT_REACT: a tool-call-free turn ENDS the run, so never
+// stop just to lay out a plan). The plan-execute family's PLAN phase is the one
+// place that must instead answer with a bare JSON plan, so that clause
+// (PROMPT_ACT_PLAN) lives ONLY on the plan leaf, via `ReactConfig::system_prompt`
+// (SC-10) — a per-leaf prompt that REPLACES the global one for that leaf's window
+// (see [`plan_leaf_prompt`] / [`plan_execute_strategy`]). Keeping it off the
+// global prompt fixes two leaks at once: a bare ReAct run can no longer end early
+// by emitting a plan as text, and plan-execute's EXECUTE phase no longer inherits
+// the "you may answer with a plan" escape hatch it never wanted.
 
-/// Opening: who the agent is and the tool palette. Common to every strategy.
+/// Opening: who the agent is and the tool palette. Common to every strategy AND
+/// to the plan leaf (both [`base_system_prompt`] and [`plan_leaf_prompt`]).
 const PROMPT_INTRO: &str = "You are a coding agent working inside a sandboxed workspace directory. \
      Explore with list_dir, read_file, grep, and find_files; create and change files with \
      write_file and edit_file; run commands (builds, tests) with bash_command. Use `.` and \
      relative paths only.";
 
-/// Act directive for the **ReAct** baseline. There is no plan phase here, so the
-/// "answer with a bare JSON plan" escape hatch is deliberately ABSENT: a turn in
-/// which the model calls no tool ends the run with that text as its final answer,
-/// so emitting a plan instead of acting would finish the run having built
-/// nothing. Spelled out so a weak model can't stop at "here's my plan."
+/// Act directive for the BASE prompt — every strategy, plus the plan-execute
+/// family's EXECUTE phase. The "answer with a bare JSON plan" escape hatch is
+/// deliberately ABSENT: a turn in which the model calls no tool ends the run with
+/// that text as its final answer, so emitting a plan instead of acting would
+/// finish the run having built nothing. The plan PHASE gets the opposite
+/// instruction via [`plan_leaf_prompt`], which replaces this for that one leaf.
+/// Spelled out so a weak model can't stop at "here's my plan."
 const PROMPT_ACT_REACT: &str = "Act using tools — do not just describe what you would do. \
      A turn in which you call NO tool ends the run immediately, with whatever text you wrote taken \
      as your final answer — so never stop just to lay out a plan or list the steps you intend to \
      take; keep acting until you have run the tests and seen them pass.";
 
-/// Act directive for the **plan-execute family** (plan-execute, hillclimb). Their
-/// PLAN phase is required to answer with a single JSON plan object and no tool
-/// calls, so the escape hatch belongs here — and ONLY here.
+/// Act directive for the plan-execute family's PLAN LEAF only. The plan phase is
+/// required to answer with a single JSON plan object and no tool calls, so the
+/// escape hatch belongs here — and ONLY here. Combined with [`PROMPT_INTRO`] into
+/// the self-contained [`plan_leaf_prompt`] that `ReactConfig::system_prompt`
+/// installs on the plan leaf, REPLACING the base prompt for that window (SC-10).
 const PROMPT_ACT_PLAN: &str = "Act using tools — do not just describe what you would do. \
      (The one exception: when you are asked to PRODUCE A PLAN, reply with the requested JSON plan \
      object directly, with no tool calls in that turn — make each task one concrete, \
@@ -221,6 +231,38 @@ impl PromptBuilder {
     }
 }
 
+/// The base operating prompt — installed on the harness via
+/// [`HarnessBuilder::system_prompt`] and used by every strategy, including the
+/// plan-execute family's EXECUTE phase. It carries the ReAct act directive (no
+/// plan escape hatch). The PLAN phase overrides it per-leaf with
+/// [`plan_leaf_prompt`]. `build_note` is the (possibly empty) per-write
+/// build-check note; an empty one is dropped by [`PromptBuilder::push`].
+fn base_system_prompt(build_note: &str) -> String {
+    PromptBuilder::new()
+        .push(PROMPT_INTRO)
+        .push(PROMPT_ACT_REACT)
+        .push(PROMPT_VERIFY)
+        .push(build_note)
+        .push(PROMPT_DONE)
+        .push(PROMPT_NARRATION)
+        .push(PROMPT_SKILLS)
+        .build()
+}
+
+/// The plan leaf's self-contained system prompt (SC-10). Set as
+/// `ReactConfig::system_prompt` on the plan leaf, where it REPLACES the base
+/// prompt for that leaf's window — so it must stand alone. It is deliberately
+/// minimal: the tool palette plus the "produce a single JSON plan" act directive.
+/// No verify/narration/skills clauses — those are execution concerns, and the
+/// skills manifest is injected structurally by [`HarnessBuilder::skills`] anyway,
+/// so the planner still sees what skills exist when shaping the task list.
+fn plan_leaf_prompt() -> String {
+    PromptBuilder::new()
+        .push(PROMPT_INTRO)
+        .push(PROMPT_ACT_PLAN)
+        .build()
+}
+
 /// Per-loop ReAct step budget for EACH execute-phase task (04 used 8; a coding
 /// task wants more room to explore, edit, and verify). The plan phase runs under
 /// its own, smaller budget (`PLAN_STEPS`).
@@ -229,17 +271,6 @@ const MAX_STEPS: u32 = 25;
 /// Per-loop ReAct step budget for the PLAN phase — a few turns for the planner to
 /// look around (read_file / grep / list_dir) before it emits its JSON plan.
 const PLAN_STEPS: u32 = 12;
-
-/// When a turn pauses because a step budget was spent, the REPL auto-grants more
-/// budget and resumes — up to this many times per turn — so the agent keeps
-/// working the task list without you babysitting it. The cap stops a stuck task
-/// from burning tokens forever; if it's hit, the turn ends with a note.
-const MAX_AUTO_CONTINUES: u32 = 10;
-
-/// Steps granted on each auto-continue. `ContinueWithBudget` raises the exhausted
-/// scope's cap past where it stopped, so the in-flight task gets this many more
-/// steps (and its stalled worker is re-seeded — no work is lost).
-const CONTINUE_STEPS: u32 = MAX_STEPS;
 
 /// HillClimbing only: how many consecutive non-improving iterations to tolerate
 /// before the climb stops. `attempt → score → keep iff strictly better → revise`
@@ -261,15 +292,6 @@ const EXAMINER_TIMEOUT_SECS: u64 = 180;
 ///       held-out 15 adversarial tests, disjoint inputs.
 const FIXTURE_VERSION: &str = "v2";
 
-/// Registry key for the plan slot's output schema. The PlanExecute `plan` slot is
-/// STRUCTURED — startup validation rejects a bare ReAct there unless its leaf
-/// declares an `output` schema (so the slot yields a typed result). We register an
-/// empty schema under this key and point the plan leaf at it. With
-/// `enforce_output_schemas` OFF (the default) the schema is used ONLY to satisfy
-/// that validation — it is not delivered to or enforced on the model; the plan
-/// phase's own "respond with a single JSON plan" directive drives the format.
-const PLAN_SCHEMA_KEY: &str = "plan";
-
 /// Compaction window, in tokens — the size the harness believes the model's
 /// context is, and the budget it compacts against. gemma4's real window is 256K,
 /// but the harness's #141 resolver only falls back to a static table that maps
@@ -278,7 +300,11 @@ const PLAN_SCHEMA_KEY: &str = "plan";
 /// headroom instead of compacting ~30× too early. Override for a smaller model
 /// with `--context-window <tokens>` / `SPORE_CONTEXT_WINDOW` — the value is used
 /// as-is and is NOT clamped to the model's true window, so don't set it larger
-/// than the model can actually hold.
+/// than the model can actually hold. We apply it with ONE call —
+/// [`OllamaModelInterface::with_context_window`] (SC-4): that sets Ollama's
+/// `num_ctx` (sizing the KV cache, so longer prompts aren't silently truncated)
+/// AND the window reported by `provider()`, which the preset's compaction budget
+/// auto-derives — so one knob sizes both halves.
 const DEFAULT_CONTEXT_WINDOW: u32 = 256_000;
 
 /// Fraction of the window at which the harness compacts. `should_compact` fires
@@ -380,71 +406,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&workspace_root)?;
     let workspace_root = std::fs::canonicalize(&workspace_root)?;
 
-    // The SAME conversational ReAct harness as 04 — the differences are a
-    // read-WRITE sandbox, the full coding catalogue, and a context window sized
-    // for the model (below). Built once and reused for every REPL turn. Held in an
-    // `Arc` so the SAME sandbox also backs the out-of-band held-out scoreboard (the
-    // examiner runs `cargo test` through it, see `score_heldout`).
-    let sandbox = Arc::new(WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(
-        workspace_root.clone(),
-    ))?);
-
-    // `conversational` installs a context manager whose compaction window
-    // resolves to the gemma static fallback (8K). Override it with one configured
-    // for the model's real window so the persisted conversation isn't compacted
-    // prematurely. The context manager needs its own model handle (it uses it
-    // only for compaction summarization), so build a second cheap instance —
-    // `OllamaModelInterface` is config-only and isn't `Clone`.
-    // `context_length` is the model's TOTAL window; compaction fires earlier, at
-    // `threshold × window` (should_compact: used/window >= threshold), leaving
-    // headroom for the turn that crosses the line. 0.80 is the default — set it
-    // explicitly here so the 80% trigger is visible, not buried in a default.
-    let base_adapter = Arc::new(StandardContextManager::new(
-        Arc::new(OllamaModelInterface::with_base_url(&model_id, base_url.clone())),
-        Arc::new(NullCacheProvider),
-        CompactionConfig {
-            context_length: Some(context_window),
-            threshold: COMPACT_THRESHOLD,
-            ..Default::default()
-        },
-    ))
-    .into_harness_adapter();
-
-    // --- Skills (the Agent Skills spec, wired example-side) -------------------
-    // Discover `SKILL.md` files (bundled with the example + `.spore/skills` in the
-    // workspace + `~/.spore/skills`). The manifest (name + description of every
-    // skill) is injected every turn; a skill's full body is injected only once it
-    // is ACTIVE. A skill goes active when the agent calls `load_skill` (it should,
-    // when a request matches a skill's description) or when you load it yourself
-    // with `/<name>`. The active set is shared in-process across all three sites.
-    let catalog = skills::SkillCatalog::bootstrap(&workspace_root);
-    let known = catalog.names();
-    let active = skills::new_active_set();
-    // Wrap the compaction adapter so the manifest + active bodies ride along every
-    // turn — the live loop bypasses the rich `assemble` (Known Deviation #8 / #115).
-    let context_manager = Arc::new(skills::SkillInjectingContextManager::new(
-        base_adapter,
-        active.clone(),
-        catalog.manifest(),
-    ));
-
-    // Per-write build feedback: wrap `write_file` / `edit_file` so each source
-    // write is immediately compiled and the compiler's verdict folded into the
-    // tool result. This makes compile feedback UNAVOIDABLE — the model can no
-    // longer barrel past a broken write the way prompt guidance alone allowed
-    // (the documented rewrite-spiral failure). Off with CORDYCEPS_BUILD_CHECK=off;
-    // see `build_check`.
-    let build_check = build_check::BuildCheck::from_env();
-    let coding_tools: Vec<_> = match build_check.as_ref() {
-        Some(check) => {
-            let check = Arc::new(check.clone());
-            StandardTools::coding_set()
-                .into_iter()
-                .map(|t| build_check::wrap_write_tool(t, &check))
-                .collect()
-        }
-        None => StandardTools::coding_set(),
+    // ONE hardened, strategy-specific workspace sandbox, held in an `Arc` and
+    // shared by everything: the harness's own tools (via `.sandbox` on both arms
+    // below — this OVERRIDES the `coding_agent` preset's internal sandbox), the
+    // build-check middleware, the out-of-band scoreboard (`score_run`), and the
+    // climb's `GitVcsProvider`. One sandbox ⇒ writes, the build check, and the
+    // scorers all see the same bytes through the same exec hardening.
+    //
+    // SC-12: harden every `cargo`/`git`/`bash` the agent and scorers spawn.
+    let exec = spore_core::sandbox::ExecConfig {
+        close_stdin: true, // child stdin → /dev/null: a build/test/git can't hang on a prompt
+        kill_on_drop: true, // an Esc-abort drops the run future → reap cargo instead of orphaning it
+        non_interactive_env: [
+            ("CARGO_TERM_COLOR", "never"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("CI", "1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+        default_timeout: None, // build_check + the evaluators pass explicit timeouts that always win
     };
+    // SC-13: a hard write-wall, HILLCLIMB ONLY (the proposer may READ the whole
+    // repo but WRITE only `csv-task/` — a sandbox-enforced anti-gaming boundary,
+    // not just convention + `reset-task.sh`'s after-the-fact tamper guard).
+    // react/plan-execute keep full write scope so they stay usable as general
+    // baselines on any `--workspace` dir; gated on `csv-task` actually existing so
+    // a `--workspace <other>` hillclimb run isn't trapped behind a missing dir.
+    let write_root = matches!(strategy, Strategy::HillClimb)
+        .then(|| workspace_root.join("csv-task"))
+        .filter(|p| p.exists());
+    let sandbox = Arc::new(WorkspaceScopedSandbox::new(WorkspaceConfig {
+        exec_config: Some(exec),
+        write_root,
+        ..WorkspaceConfig::scoped(workspace_root.clone())
+    })?);
+
+    // --- Skills (the Agent Skills spec, native in the harness) ----------------
+    // Pass the BUNDLED `skills/` dir explicitly; `SkillCatalog::discover` adds
+    // `<workspace>/.spore/skills` and `~/.spore/skills` itself (all three tiers).
+    // `HarnessBuilder::skills` (below) registers the catalog AND the `load_skill`
+    // tool, and the harness injects the manifest (every turn) + each ACTIVE skill's
+    // full body (sticky) STRUCTURALLY via the rich `ContextSources` seam (#115 /
+    // SC-26) — no example-side context-manager wrapper, no second model handle. A
+    // skill goes active when the agent calls `load_skill` or when you load it
+    // yourself with `/<name>`; the `Arc` is shared between the harness and this
+    // REPL, so both see the same active set.
+    let catalog = spore_core::SkillCatalog::discover(
+        &[std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills")],
+        &workspace_root,
+    );
+
+    // Per-write build feedback (T3.3): an `AfterTool` middleware compiles the
+    // project after each successful source write and folds the compiler's verdict
+    // into the tool result — a broken write comes back as a recoverable ERROR, so
+    // the model can no longer barrel past it the way prompt guidance alone allowed
+    // (the documented rewrite-spiral failure). The rich `AfterTool` chain is now
+    // loop-wired (Phase 3), so this composes with the preset's own tools instead of
+    // wrapping and re-supplying them, and it captures `sandbox` so the build runs
+    // through the SAME hardened sandbox as the writes. Coverage is uniform: the
+    // middleware fires on every `AfterTool` across react / plan-execute / hillclimb;
+    // the read-only plan phase no-ops via the path check. Off with
+    // CORDYCEPS_BUILD_CHECK=off (then no middleware is registered); see `build_check`.
+    let build_check = build_check::BuildCheck::from_env();
+    let middleware: Option<Arc<dyn MiddlewareChain>> = build_check.as_ref().map(|bc| {
+        let chain = StandardMiddlewareChain::new();
+        chain
+            .register(Box::new(build_check::BuildCheckMiddleware::new(
+                bc.clone(),
+                sandbox.clone(),
+            )))
+            .expect("register build-check middleware");
+        Arc::new(chain) as Arc<dyn MiddlewareChain>
+    });
 
     // Only promise the auto-compile feedback in the prompt when it is actually
     // wired (otherwise the model would skip its own verification trusting a
@@ -454,62 +488,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         ""
     };
-    // Compose the prompt for the chosen strategy: the ReAct baseline omits the
-    // "answer with a bare JSON plan" clause that only the plan-execute family's
-    // plan phase needs (see the fragment block above).
-    let system_prompt = strategy.system_prompt(build_note);
+    // ONE base prompt for every strategy (and the plan-execute family's EXECUTE
+    // phase); the plan PHASE overrides it per-leaf in `plan_execute_strategy`.
+    let system_prompt = base_system_prompt(build_note);
 
-    let model = OllamaModelInterface::with_base_url(&model_id, base_url);
-    let harness = HarnessBuilder::conversational(model)
-        .sandbox(sandbox.clone())
-        // The coding catalogue (with build-checked write/edit) PLUS the
-        // architect-side `load_skill` tool, so the agent can pull a skill's full
-        // procedure into context on demand.
-        .tools(coding_tools)
-        .tool(skills::load_skill_tool(active.clone(), known.clone()))
-        .system_prompt(system_prompt)
-        // Request the model's reasoning pass at the chosen effort level.
-        // spore-core's Ollama client maps `reasoning_effort` to
-        // `think: "low"|"medium"|"high"|"max"` (gated on the model's `"thinking"`
-        // capability) and surfaces the trace as `ReasoningDelta` stream events,
-        // which the sink prints live. Everything else stays at `ModelParams::default`.
-        .model_params(ModelParams {
-            reasoning_effort,
-            ..Default::default()
-        })
-        .context_manager(context_manager)
-        // PlanExecute's `plan` slot is structured: its output schema must resolve
-        // against the registry (see PLAN_SCHEMA_KEY) or startup validation fails.
-        // (HillClimbing's `inner` is PlanExecute, so it reuses this same schema.)
-        .registry_schema(PLAN_SCHEMA_KEY, serde_json::json!({}))
-        // The DEV scorer drives the climb: HillClimbing calls it each iteration and
-        // routes the result through keep-iff-strictly-better. It scores the VISIBLE
-        // dev set (csv-task/tests/dev.rs) — the feedback the agent revises against.
-        // The held-out set is NEVER wired here; it is the blind scoreboard, measured
-        // out of band (see `score_heldout`). Registered unconditionally — only the
-        // `hillclimb` strategy calls it (react / plan-execute ignore it), but the
-        // HillClimbing `evaluator` handle must resolve at startup or the run halts
-        // with an UnresolvedHandle. Keeps one harness build path for all three.
-        .metric_evaluator(dev_evaluator())
-        // Surface the plan to the user the moment it's captured (OnPlanCreated).
-        .hooks(plan_announcer())
-        .build();
+    // The model, sized in ONE call (SC-4): `with_context_window` sets Ollama's
+    // `num_ctx` AND the window `provider()` reports, which the preset's compaction
+    // budget auto-derives — so no manual `context_manager` override is needed.
+    let model = OllamaModelInterface::with_base_url(&model_id, base_url)
+        .with_context_window(context_window);
+
+    // Request the model's reasoning pass at the chosen effort level. spore-core's
+    // Ollama client maps `reasoning_effort` to `think: "low"|"medium"|"high"|"max"`
+    // (gated on the model's `"thinking"` capability) and surfaces the trace as
+    // `ReasoningDelta` stream events, which the sink prints live. Everything else
+    // stays at `ModelParams::default`.
+    let reasoning = ModelParams {
+        reasoning_effort,
+        ..Default::default()
+    };
+
+    // Build the harness from the strategy-appropriate PRESET (SC-8), then layer
+    // this example's extras. BOTH presets set `EscalationMode::AutoContinue`
+    // (SC-5), so a spent step budget keeps working IN-PROCESS — there is no
+    // hand-rolled drive/resume loop. `.sandbox(sandbox.clone())` on BOTH arms
+    // installs the one hardened sandbox (overriding the `coding_agent` preset's
+    // internal one, so react/plan-execute also get the SC-12 exec hardening).
+    // `.skills` registers the catalog + `load_skill` and injects the manifest/active
+    // bodies structurally; `.system_prompt` overrides the preset's built-in with the
+    // richer base prompt; `.hooks` prints each plan as captured. We produce the
+    // strategy-specific builder first, then apply the optional build-check
+    // middleware uniformly. Built once, reused every turn.
+    let builder = match strategy {
+        // `coding_agent` already supplies the coding tool set, so we do NOT
+        // re-supply `.tools` — the build check rides the middleware now, not the
+        // tools, so there is no wrap-and-re-supply dance.
+        Strategy::React | Strategy::PlanExecute => {
+            HarnessBuilder::coding_agent(model, workspace_root.clone())?
+                .sandbox(sandbox.clone())
+                .skills(catalog.clone())
+                .system_prompt(system_prompt)
+                .model_params(reasoning)
+                .hooks(plan_announcer())
+        }
+        // `hill_climber` registers the DEV scorer under the default handle (what
+        // HillClimbing's empty `evaluator` resolves to) and the AutoContinue policy
+        // — nothing else — so we add the sandbox, the plain coding tools the climb
+        // needs, and an explicit revert provider. The DEV scorer drives
+        // keep-iff-strictly-better; the held-out set is NEVER wired here — it is the
+        // blind scoreboard, measured out of band (see `score_run`).
+        Strategy::HillClimb => HarnessBuilder::hill_climber(model, dev_evaluator())
+            .sandbox(sandbox.clone())
+            .tools(StandardTools::coding_set())
+            .skills(catalog.clone())
+            .system_prompt(system_prompt)
+            .model_params(reasoning)
+            .hooks(plan_announcer())
+            // SC-14: wire the revert explicitly. Byte-identical to spore-core's
+            // default fallback (`git reset --hard HEAD` through the sandbox), but it
+            // makes the climb's rollback mechanism explicit in cordyceps and shares
+            // the one hardened sandbox. FOOTGUN: `git reset --hard HEAD` reverts the
+            // WHOLE working tree, so commit `agent/` before climbing; a
+            // `csv-task`-scoped custom VcsProvider (matching `write_root`) is a
+            // possible follow-up, once we trace how `revert_on_no_improvement`
+            // interacts with best-so-far retention.
+            .vcs_provider(Arc::new(GitVcsProvider::new(
+                sandbox.clone(),
+                workspace_root.clone(),
+            ))),
+    };
+    // Apply the build-check middleware uniformly across strategies (when enabled).
+    let builder = match &middleware {
+        Some(mw) => builder.middleware(mw.clone()),
+        None => builder,
+    };
+    let harness = builder.build();
 
     println!("cordyceps agent — spore-core HillClimber harness");
     println!("model     : {model_id}");
+    // SC-16 (Phase 4): there is still no public API to query thinking support at
+    // startup (`supports_thinking()` is private; `ProviderInfo` exposes only
+    // name/model/window), so this banner can't be made provably honest before the
+    // first request. It now marks the level as REQUESTED rather than asserting it,
+    // and spore-core emits a one-time `[spore-core]` warning on the first request
+    // when `reasoning_effort` is dropped on a non-thinking model — so the no-op is
+    // noisy rather than silent.
     println!(
         "reasoning : {}",
         match reasoning_effort {
-            Some(ReasoningEffort::Low) => "low → think:\"low\" on thinking-capable models",
-            Some(ReasoningEffort::Medium) => "medium → think:\"medium\"",
-            Some(ReasoningEffort::High) => "high → think:\"high\"",
-            Some(ReasoningEffort::Max) => "max → think:\"max\"",
+            Some(ReasoningEffort::Low) => "low (requested → think:\"low\")",
+            Some(ReasoningEffort::Medium) => "medium (requested → think:\"medium\")",
+            Some(ReasoningEffort::High) => "high (requested → think:\"high\")",
+            Some(ReasoningEffort::Max) => "max (requested → think:\"max\")",
             None => "off (--reasoning low|medium|high|max or $SPORE_REASONING_EFFORT)",
         }
     );
+    if reasoning_effort.is_some() {
+        println!(
+            "          ↳ dropped on a non-thinking model (spore-core warns once on first request)"
+        );
+    }
     println!("strategy  : {}", strategy.banner());
     println!(
-        "context   : {context_window} tokens (compact at {:.0}% → {} tokens)",
+        "auto-cont : up to {} grants × {} steps in-process when a step budget is spent (preset)",
+        HarnessBuilder::PRESET_MAX_AUTO_GRANTS,
+        HarnessBuilder::PRESET_STEPS_PER_GRANT,
+    );
+    println!(
+        "context   : {context_window} tokens (num_ctx sent to Ollama; compact at {:.0}% → {} tokens)",
         COMPACT_THRESHOLD * 100.0,
         (context_window as f32 * COMPACT_THRESHOLD) as u32,
     );
@@ -527,7 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "skills    : {} discovered — load with /<name>, or the agent loads via load_skill (/skills to list)",
-        known.len()
+        catalog.entries().len()
     );
     println!("Type a coding task and press enter. Esc aborts a running task; Ctrl-D quits.\n");
 
@@ -553,7 +639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // forgets the dialogue.
         if trimmed.eq_ignore_ascii_case("clear") {
             history = None;
-            active.lock().unwrap().clear();
+            catalog.clear_active();
             println!("(conversation cleared)\n");
             continue;
         }
@@ -567,11 +653,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(c, r)| (c, r.trim()))
                 .unwrap_or((rest, ""));
             if cmd.eq_ignore_ascii_case("skills") {
-                print_skills(&catalog, &active);
+                print_skills(&catalog);
                 continue;
             }
-            if known.iter().any(|n| n == cmd) {
-                active.lock().unwrap().insert(cmd.to_string());
+            if catalog.activate(cmd) {
                 println!("✓ loaded skill '{cmd}' — active for this conversation.\n");
                 if inline.is_empty() {
                     continue; // just loaded; wait for the next prompt
@@ -602,8 +687,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // The stream sink prints each turn (Think) and each tool call + result
         // (Act / Observe) AND mirrors the turn into `turn_msgs` for the abort path.
-        // It's built as a shareable `Arc` so the SAME sink feeds both the initial
-        // run and any budget-grant resumes (see `drive`). Lines END WITH `\r\n`,
+        // It's built as a shareable `Arc` and assigned to `on_stream`; the preset's
+        // in-process AutoContinue grants reuse the SAME sink. Lines END WITH `\r\n`,
         // not `\n`: the run executes with the terminal in raw mode (so a bare Esc
         // can abort it), and raw mode turns off the kernel's `\n`→`\r\n`
         // translation — without the `\r` the trace would stair-step to the right.
@@ -694,9 +779,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             });
         // Assign `on_stream` directly (it's a public `Option<StreamSink>`) rather
-        // than `with_stream`, which wants a bare `Fn` — our sink is already the
-        // shared `Arc` so we can hand the SAME one to `resume` inside `drive`.
-        // Run the turn, RETRYING a transient transport failure (a dropped or
+        // than `with_stream`, which wants a bare `Fn` — our sink is already a shared
+        // `Arc`. Run the turn, RETRYING a transient transport failure (a dropped or
         // garbled stream, a flaky endpoint's GOAWAY, a timeout, a 5xx) instead of
         // letting one hiccup kill the run. Bounded, with backoff. Each attempt is a
         // fresh turn from the SAME starting point (prior `history` + this prompt),
@@ -716,9 +800,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options = options.with_session_state(state.clone());
             }
 
-            // `drive` runs the turn to a terminal result — auto-granting more
-            // budget when it pauses on a spent budget — and stays Esc-abortable.
-            let result = drive(&harness, options, sink.clone()).await;
+            // Run the turn to a terminal result, Esc-abortable throughout. The
+            // preset's `EscalationMode::AutoContinue` works a spent step budget to
+            // completion IN-PROCESS (capped at PRESET_MAX_AUTO_GRANTS), so there is
+            // no consumer-side drive/resume loop — `harness.run` returns directly.
+            let result = run_abortable(harness.run(options)).await;
             // Close any reasoning line left open (e.g. an Esc landed mid-reason)
             // before the next line — answer, retry notice, or prompt — prints.
             flush_reason(&reason_open);
@@ -789,19 +875,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session_state,
                 ..
             }) => {
-                // Keep the partial history so a follow-up turn can continue.
+                // A budget-exhausted Failure here means AutoContinue hit its grant
+                // cap (PRESET_MAX_AUTO_GRANTS) before the plan finished. Keep the
+                // partial history — the durable, project-scoped task list still holds
+                // the remaining work, so another prompt resumes it.
                 history = Some(session_state);
-                eprintln!("\nrun did not succeed: {reason:?}\n");
+                eprintln!(
+                    "\nrun did not finish: {reason:?}\n  send another prompt to keep going \
+                     (or `clear` to reset).\n"
+                );
             }
             Some(RunResult::WaitingForHuman { state, .. }) => {
-                // The auto-continue cap was hit (or an unexpected human request
-                // surfaced). Keep the conversation so a follow-up prompt can build
-                // on it; the durable task list still holds the remaining work.
+                // With AutoContinue a spent step budget no longer pauses here (the
+                // harness grants more in-process, then ends with Failure above), so a
+                // pause here is an unexpected human request. Keep the conversation so
+                // a follow-up prompt can continue; the durable task list survives.
                 history = Some(state.session_state.clone());
-                eprintln!(
-                    "\n⏸ still working after {MAX_AUTO_CONTINUES} budget grants — the plan \
-                     isn't finished. Send another prompt to keep going (or `clear` to reset).\n"
-                );
+                eprintln!("\n⏸ run paused awaiting input — send another prompt to continue.\n");
             }
             Some(RunResult::Consult { state, .. }) | Some(RunResult::Escalate { state, .. }) => {
                 // Not expected in this single-agent example, but handle it cleanly
@@ -882,32 +972,6 @@ impl Strategy {
             Strategy::HillClimb => hillclimb_strategy(),
         }
     }
-
-    /// The act directive for this strategy. Only the plan-execute family — whose
-    /// PLAN phase must answer with a bare JSON plan — gets the escape hatch; the
-    /// ReAct baseline gets the opposite instruction, because there a tool-call-
-    /// free turn ENDS the run (and so emitting a plan would build nothing).
-    fn act_directive(self) -> &'static str {
-        match self {
-            Strategy::React => PROMPT_ACT_REACT,
-            Strategy::PlanExecute | Strategy::HillClimb => PROMPT_ACT_PLAN,
-        }
-    }
-
-    /// Compose this strategy's system prompt from the shared fragments plus its
-    /// own act directive. `build_note` is the (possibly empty) per-write build-
-    /// check note; an empty one is dropped by [`PromptBuilder::push`].
-    fn system_prompt(self, build_note: &str) -> String {
-        PromptBuilder::new()
-            .push(PROMPT_INTRO)
-            .push(self.act_directive())
-            .push(PROMPT_VERIFY)
-            .push(build_note)
-            .push(PROMPT_DONE)
-            .push(PROMPT_NARRATION)
-            .push(PROMPT_SKILLS)
-            .build()
-    }
 }
 
 /// The **climb**: a [`LoopStrategy::HillClimbing`] wrapping a full plan→execute
@@ -918,13 +982,18 @@ impl Strategy {
 /// best so far. Direction is `Maximize` (more passing held-out tests is better);
 /// `revert_on_no_improvement` rolls the workspace back so a worse pass can't stick.
 ///
-/// The `inner` is `plan_execute_strategy()` — a combinator, so the structured-slot
-/// check is satisfied by PlanExecute's own `plan` schema (no extra schema needed).
+/// The `inner` is `plan_execute_strategy()` — a combinator whose plan leaf omits
+/// its output schema (SC-1 treats an absent schema as accept-all), so the
+/// structured-slot startup check passes with no registry stamp.
 fn hillclimb_strategy() -> LoopStrategy {
     LoopStrategy::HillClimbing(HillClimbingConfig {
         inner: Box::new(plan_execute_strategy()),
         direction: HillClimbingDirection::Maximize,
         max_stagnation: HILLCLIMB_MAX_STAGNATION,
+        // The revert is now wired explicitly on the builder via `GitVcsProvider`
+        // (SC-14) — see the `hill_climber` arm in `main`. It runs `git reset --hard
+        // HEAD` through the shared sandbox (byte-identical to spore-core's default
+        // fallback), so a worse pass can't stick.
         revert_on_no_improvement: true,
         // Any strict improvement counts — the held-out metric is granular (k/N).
         min_improvement_delta: 0.0,
@@ -964,7 +1033,7 @@ fn dev_evaluator() -> Arc<dyn MetricEvaluator> {
 
 /// The **held-out** evaluator — the blind scoreboard. A [`TestPassRateEvaluator`]
 /// over the HIDDEN set (`csv-examiner/tests/heldout.rs`, 15 adversarial tests). Run out of band
-/// by [`score_heldout`] after each turn, recorded to disk, and NEVER registered on
+/// by [`score_run`] after each turn, recorded to disk, and NEVER registered on
 /// the harness, so it can never leak into the loop's keep-iff-better decision.
 fn heldout_evaluator() -> TestPassRateEvaluator {
     pass_rate_evaluator("csv-examiner/Cargo.toml", "heldout")
@@ -1128,12 +1197,15 @@ enter. Esc aborts a running task; Ctrl-D quits."
 /// - **plan** — a ReAct sub-loop (≤ [`PLAN_STEPS`]) that may look around with the
 ///   read tools, then emits the `{"tasks":[…],"rationale":…}` plan. The harness
 ///   seeds the "respond with a single JSON plan" directive itself; we only supply
-///   the slot. It is a STRUCTURED slot, so its leaf MUST declare an `output`
-///   schema or startup validation rejects the run — hence
-///   `Some(SchemaRef(PLAN_SCHEMA_KEY))` (registered as an empty schema on the
-///   builder; resolved, not enforced — see [`PLAN_SCHEMA_KEY`]).
-/// - **execute** — a bare ReAct leaf (≤ [`MAX_STEPS`] per task). The executor
-///   walks the durable task list, running this loop once per ready task.
+///   the slot. The leaf carries NO `output` schema: SC-1 lets a structured slot
+///   omit it (an absent schema is treated as accept-all), so no registry stamp is
+///   needed just to pass startup validation. It DOES carry its own per-leaf
+///   `system_prompt` ([`plan_leaf_prompt`], SC-10) — the one place the "answer
+///   with a bare JSON plan" clause lives, REPLACING the base prompt for this leaf
+///   so the clause never leaks into the execute phase or a bare ReAct run.
+/// - **execute** — a bare ReAct leaf (≤ [`MAX_STEPS`] per task), running under the
+///   global base prompt. The executor walks the durable task list, running this
+///   loop once per ready task.
 ///
 /// Both leaves carry empty agent/toolset handles, so they resolve to the
 /// conversational harness's default agent + `coding_set()` toolset. `Escalate` is
@@ -1145,7 +1217,8 @@ fn plan_execute_strategy() -> LoopStrategy {
             behavior: BudgetExhaustedBehavior::Escalate,
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
-            output: Some(SchemaRef(PLAN_SCHEMA_KEY.to_string())),
+            output: None,
+            system_prompt: Some(plan_leaf_prompt()),
         })),
         execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(MAX_STEPS))),
         plan_model: None,
@@ -1178,49 +1251,6 @@ fn plan_announcer() -> Arc<dyn HookChain> {
     Arc::new(chain)
 }
 
-/// Drive a freshly-built run to a TERMINAL result, auto-granting more budget when
-/// it pauses on a spent step budget so the agent keeps working the task list
-/// without you babysitting it.
-///
-/// Each `harness.run` / `harness.resume` step runs under [`run_abortable`] (Esc
-/// cancels it). When a step returns `WaitingForHuman { BudgetExhausted }` — which
-/// the conversational harness does by default (`EscalationMode::SurfaceToHuman`)
-/// when a node's step budget is spent — we resume it with a `ContinueWithBudget`
-/// grant. That raises the exhausted scope's cap AND re-seeds the stalled worker,
-/// so the in-flight task continues mid-loop without losing work. We do this up to
-/// [`MAX_AUTO_CONTINUES`] times; beyond that (or for any non-budget pause) the
-/// pause is handed back to the caller verbatim.
-///
-/// Returns `None` if the user aborted with Esc at any point.
-async fn drive(
-    harness: &dyn Harness,
-    options: HarnessRunOptions,
-    sink: Arc<dyn Fn(HarnessStreamEvent) + Send + Sync>,
-) -> Option<RunResult> {
-    let mut result = run_abortable(harness.run(options)).await?;
-    let mut granted = 0u32;
-    while let RunResult::WaitingForHuman { state, request } = result {
-        // Only auto-resume a BUDGET pause, and only up to the cap. Anything else
-        // goes back to the caller untouched.
-        if granted >= MAX_AUTO_CONTINUES || !matches!(request, HumanRequest::BudgetExhausted { .. })
-        {
-            return Some(RunResult::WaitingForHuman { state, request });
-        }
-        granted += 1;
-        // Printed between runs, so raw mode is off here — a plain `\n` is correct.
-        println!(
-            "{MUTED}   … step budget reached — granting {CONTINUE_STEPS} more \
-             ({granted}/{MAX_AUTO_CONTINUES}){RESET}"
-        );
-        let response = HumanResponse::Escalate {
-            action: EscalationAction::ContinueWithBudget {
-                steps: CONTINUE_STEPS,
-            },
-        };
-        result = run_abortable(harness.resume(*state, response, Some(sink.clone()))).await?;
-    }
-    Some(result)
-}
 
 /// Run one terminal-producing future (`harness.run` or `harness.resume`) with
 /// **Esc-to-abort** armed. Returns `Some(result)` if it finished on its own, or
@@ -1297,7 +1327,7 @@ fn watch_for_escape(stop: &std::sync::atomic::AtomicBool) {
 /// List the discovered skills and which are currently active — the `/skills`
 /// command. `●` marks an active skill (its full body is in context every turn);
 /// `○` marks one the agent (or you, via `/<name>`) can still load.
-fn print_skills(catalog: &skills::SkillCatalog, active: &skills::ActiveSkills) {
+fn print_skills(catalog: &spore_core::SkillCatalog) {
     if catalog.is_empty() {
         println!(
             "no skills found. Add one at skills/<name>/SKILL.md (next to this example) or \
@@ -1305,7 +1335,7 @@ fn print_skills(catalog: &skills::SkillCatalog, active: &skills::ActiveSkills) {
         );
         return;
     }
-    let active = active.lock().unwrap();
+    let active = catalog.active();
     println!("skills:");
     for e in catalog.entries() {
         let mark = if active.contains(&e.name) {
@@ -1351,36 +1381,21 @@ fn flush_reason(open: &AtomicBool) {
 }
 
 /// Whether an agent error is a TRANSIENT transport hiccup worth retrying — a
-/// dropped/garbled stream, a timeout, rate-limiting, or a server-side 5xx —
-/// rather than a deterministic failure (bad request, missing model, context or
+/// dropped/garbled stream, a mid-stream interruption, a timeout, or rate-limiting
+/// — rather than a deterministic failure (bad request, missing model, context or
 /// budget overflow) that a retry can't fix.
+///
+/// SC-3 moved transport drops out of the stringly-typed `ProviderError{code:0,…}`
+/// shape into the typed `ModelError::Transport` / `StreamInterrupted` variants and
+/// gave `ModelError` a `retryable()` predicate (Transport | StreamInterrupted |
+/// Timeout | RateLimited). We delegate to it instead of substring-matching the
+/// message text — so the retry loop keeps catching exactly the drops it was built
+/// for. (The loop itself stays consumer-side: spore-core does not retry
+/// internally until `RetryConfig`, Phase 5.)
 fn is_retryable_transport(error: &AgentError) -> bool {
-    let AgentError::ModelError(e) = error else {
-        // EmptyResponse / MalformedToolCall are model-behaviour, not transport.
-        return false;
-    };
-    match e {
-        ModelError::Timeout | ModelError::RateLimited { .. } => true,
-        ModelError::ProviderError { code, message } => match code {
-            // Server-side / overload — transient.
-            408 | 429 | 500 | 502 | 503 | 504 | 529 => true,
-            // code 0 = no HTTP status: a transport- or stream-decode drop (what a
-            // flaky endpoint produces mid-stream). Gate on the stream/transport
-            // markers so we DON'T retry deterministic code-0 errors like
-            // "does not support tool calling" or "request encode failed".
-            0 => {
-                let m = message.to_ascii_lowercase();
-                m.contains("stream chunk error")
-                    || m.contains("error decoding response body")
-                    || m.contains("transport error")
-            }
-            _ => false,
-        },
-        ModelError::ContextLimitExceeded { .. } | ModelError::BudgetExceeded { .. } => false,
-        // `ModelError` is #[non_exhaustive]; default a future variant to NOT
-        // retryable so we never loop on something we don't understand.
-        _ => false,
-    }
+    // Only a model-layer error can be a transport hiccup; EmptyResponse /
+    // MalformedToolCall are model behaviour a retry can't fix.
+    matches!(error, AgentError::ModelError(e) if e.retryable())
 }
 
 /// Keep observe lines readable — file contents can be long.
@@ -1397,6 +1412,10 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the retry-classifier tests construct `ModelError` variants directly; the
+    // classifier itself delegates to `ModelError::retryable()`, so the live code
+    // path no longer names the type.
+    use spore_core::ModelError;
 
     fn provider(code: u16, message: &str) -> AgentError {
         AgentError::ModelError(ModelError::ProviderError {
@@ -1407,46 +1426,58 @@ mod tests {
 
     #[test]
     fn retries_the_mid_stream_decode_drop() {
-        // The exact error from the field: a transient mid-stream transport drop.
-        assert!(is_retryable_transport(&provider(
-            0,
-            "stream chunk error: error decoding response body"
+        // The exact error from the field, now typed (SC-3): a transient mid-stream
+        // interruption while draining the response body.
+        assert!(is_retryable_transport(&AgentError::ModelError(
+            ModelError::StreamInterrupted {
+                message: "stream chunk error: error decoding response body".into(),
+            }
         )));
     }
 
     #[test]
     fn retries_transient_classes() {
+        // The four transient variants `ModelError::retryable()` recognizes.
+        assert!(is_retryable_transport(&AgentError::ModelError(
+            ModelError::Transport {
+                message: "connection reset by peer".into(),
+            }
+        )));
+        assert!(is_retryable_transport(&AgentError::ModelError(
+            ModelError::StreamInterrupted {
+                message: "stream chunk error".into(),
+            }
+        )));
         assert!(is_retryable_transport(&AgentError::ModelError(
             ModelError::Timeout
         )));
         assert!(is_retryable_transport(&AgentError::ModelError(
             ModelError::RateLimited { retry_after: None }
         )));
-        for code in [408, 429, 500, 502, 503, 504, 529] {
-            assert!(
-                is_retryable_transport(&provider(code, "server error")),
-                "code {code} should retry"
-            );
-        }
-        assert!(is_retryable_transport(&provider(
-            0,
-            "HTTP transport error: connection reset by peer"
-        )));
     }
 
     #[test]
     fn does_not_retry_deterministic_failures() {
-        // code 0 but NOT a transport drop — a retry can't help.
+        // SC-3: a COMPLETE response that fails to decode, a capability error, a
+        // bad request, and server 5xx all stay `ProviderError` — deterministic, so
+        // a retry can't help. (Transient transport now has its own typed variants.)
         assert!(!is_retryable_transport(&provider(
             0,
             "Model gemma4:26b does not support tool calling"
         )));
         assert!(!is_retryable_transport(&provider(404, "Model not found")));
         assert!(!is_retryable_transport(&provider(400, "bad request")));
+        assert!(!is_retryable_transport(&provider(500, "server error")));
         assert!(!is_retryable_transport(&AgentError::ModelError(
             ModelError::ContextLimitExceeded {
                 limit: 8192,
                 actual: 9000,
+            }
+        )));
+        assert!(!is_retryable_transport(&AgentError::ModelError(
+            ModelError::BudgetExceeded {
+                budget: 1000,
+                used: 1200,
             }
         )));
         assert!(!is_retryable_transport(&AgentError::EmptyResponse));
@@ -1456,30 +1487,39 @@ mod tests {
         }));
     }
 
-    /// The leak that ended a ReAct run early: only the plan-execute family may
-    /// carry the "answer with a bare JSON plan" clause. ReAct must NOT — there a
-    /// tool-call-free turn is the final answer, so a plan would build nothing.
+    /// T3.4: the "answer with a bare JSON plan" clause lives ONLY on the plan leaf
+    /// (`plan_leaf_prompt`), never in the base prompt. The base prompt drives every
+    /// strategy and the plan-execute family's EXECUTE phase — so keeping the clause
+    /// off it fixes both leaks: a bare ReAct run can't end early by emitting a plan
+    /// (a tool-call-free turn is its final answer), and the execute phase never
+    /// inherits the escape hatch.
     #[test]
-    fn react_prompt_omits_the_plan_escape_hatch() {
-        let react = Strategy::React.system_prompt("");
+    fn plan_clause_lives_only_on_the_plan_leaf() {
         assert!(
-            !react.contains("PRODUCE A PLAN"),
-            "ReAct prompt must not invite a bare-JSON-plan answer"
+            !base_system_prompt("").contains("PRODUCE A PLAN"),
+            "base prompt must not invite a bare-JSON-plan answer"
         );
-        for plan_family in [Strategy::PlanExecute, Strategy::HillClimb] {
-            assert!(
-                plan_family.system_prompt("").contains("PRODUCE A PLAN"),
-                "{plan_family:?} plan phase needs the JSON-plan clause"
-            );
-        }
+        assert!(
+            plan_leaf_prompt().contains("PRODUCE A PLAN"),
+            "the plan leaf needs the JSON-plan clause"
+        );
+        // The plan leaf must stand alone (it REPLACES the base prompt, SC-10): it
+        // still introduces the tool palette, but carries none of the execution-only
+        // clauses (verify discipline, narration), which would distract the planner.
+        let plan = plan_leaf_prompt();
+        assert!(plan.contains("sandboxed workspace"), "plan leaf keeps the intro");
+        assert!(
+            !plan.contains("Work in small, VERIFIED steps"),
+            "plan leaf should not carry the execute-phase verify discipline"
+        );
     }
 
     /// The build note is spliced in only when the per-write check is on, and
     /// pushing an empty note leaves no dangling separator behind.
     #[test]
     fn build_note_is_conditional_and_leaves_no_double_space() {
-        let without = Strategy::React.system_prompt("");
-        let with = Strategy::React.system_prompt(BUILD_CHECK_NOTE);
+        let without = base_system_prompt("");
+        let with = base_system_prompt(BUILD_CHECK_NOTE);
         assert!(!without.contains("AUTOMATICALLY compile"));
         assert!(with.contains("AUTOMATICALLY compile"));
         assert!(!without.contains("  "), "empty fragment left a double space");
